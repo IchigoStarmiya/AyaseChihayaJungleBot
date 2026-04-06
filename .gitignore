@@ -1,1 +1,4 @@
-﻿/VoiceTimerBot.csproj
+﻿bin
+obj
+.idea
+appsettings.json
