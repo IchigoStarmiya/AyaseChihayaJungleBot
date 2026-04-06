@@ -1,0 +1,15 @@
+{
+  "Discord": {
+    "Token": "YOUR TOKEN HERE"
+  },
+  "VoiceTimer": {
+    "GuildId": 0,
+    "ChannelId": 0,
+    "StartClipPath": "Audio/jungle.ogg",
+    "Warn40s": "Audio/respawn40.mp3",
+    "Warn20s": "Audio/respawn20.mp3",
+    "MaiJungle": "Audio/jungle.ogg",
+    "FfmpegPath": "ffmpeg"
+  },
+  "CouncilRole": [0]
+}
