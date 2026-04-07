@@ -8,7 +8,7 @@ using VoiceTimerBot.Interfaces;
 namespace VoiceTimerBot.Modules.SlashCommands;
 
 [UsedImplicitly]
-public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, IMaiJungleService maiJungleService, IConfiguration configuration, RestClient restClient)
+public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, IConfiguration configuration, RestClient restClient)
     : ApplicationCommandModule<ApplicationCommandContext>
 {
     [SlashCommand("starttimer", "Start (or reset) the voice channel timer")]

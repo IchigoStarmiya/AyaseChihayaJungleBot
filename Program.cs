@@ -13,7 +13,6 @@ builder.Services.Configure<VoiceTimerSettings>(
     builder.Configuration.GetSection("VoiceTimer"));
 
 builder.Services.AddSingleton<IVoiceTimerService, VoiceTimerService>();
-builder.Services.AddSingleton<IMaiJungleService, MaiJungleService>();
 
 builder.Services
        .AddDiscordGateway(options =>
