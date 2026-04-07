@@ -8,6 +8,13 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <None Include="Native/libdave.so" Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <Link>libdave.so</Link>
+        </None>
+    </ItemGroup>
+
+    <ItemGroup>
         <PackageReference Include="JetBrains.Annotations" Version="2025.2.4" />
         <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3"/>
         <PackageReference Include="NetCord" Version="1.0.0-alpha.468"/>
