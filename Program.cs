@@ -17,7 +17,7 @@ builder.Services.AddSingleton<IVoiceTimerService, VoiceTimerService>();
 builder.Services
        .AddDiscordGateway(options =>
         {
-            options.Intents = GatewayIntents.GuildVoiceStates;
+            options.Intents = GatewayIntents.GuildVoiceStates | GatewayIntents.GuildMessages | GatewayIntents.MessageContent;
         })
        .AddApplicationCommands()
        .AddGatewayHandlers(typeof(Program).Assembly);
