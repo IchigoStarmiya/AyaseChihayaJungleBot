@@ -23,37 +23,37 @@ public class VoiceTimerService(
     private static readonly TimeSpan Warn20s = TimeSpan.FromSeconds(20);
 
     private readonly VoiceTimerSettings _settings = options.Value;
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly Dictionary<ulong, GuildTimerState> _guilds =
+        options.Value.Servers.ToDictionary(s => s.GuildId, s => new GuildTimerState(s));
 
-    private VoiceClient? _voiceClient;
-    private Stream? _voiceStream;
-    private CancellationTokenSource? _cts;
-    private Task? _timerTask;
-    private Func<ValueTask>? _voiceCloseHandler;
+    public bool IsRunning(ulong guildId) =>
+        _guilds.TryGetValue(guildId, out var state) && state.IsRunning;
 
-    public bool IsRunning => _timerTask is { IsCompleted: false };
+    public bool IsConfigured(ulong guildId) => _guilds.ContainsKey(guildId);
 
-    public async Task StartAsync(CancellationToken cancellationToken = default)
+    public async Task StartAsync(ulong guildId, CancellationToken cancellationToken = default)
     {
-        await _lock.WaitAsync(cancellationToken);
+        var state = _guilds[guildId];
+
+        await state.Lock.WaitAsync(cancellationToken);
         try
         {
-            await StopCoreAsync();
+            await StopCoreAsync(state);
 
             // Give Discord time to process the voice-leave before immediately rejoining.
             // Without this, the VoiceStateUpdate + VoiceServerUpdate events that
             // JoinVoiceChannelAsync waits for may never arrive and the call times out.
             await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
 
-            _cts = new CancellationTokenSource();
-            var token = _cts.Token;
+            state.Cts = new CancellationTokenSource();
+            var token = state.Cts.Token;
 
             logger.LogInformation("VoiceTimer: [1] Sending voice join to gateway (guild={GuildId}, channel={ChannelId})",
-                _settings.GuildId, _settings.ChannelId);
+                state.Settings.GuildId, state.Settings.ChannelId);
 
-            _voiceClient = await gatewayClient.JoinVoiceChannelAsync(
-                _settings.GuildId,
-                _settings.ChannelId,
+            state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
+                state.Settings.GuildId,
+                state.Settings.ChannelId,
                 new VoiceClientConfiguration(),
                 cancellationToken);
 
@@ -61,7 +61,7 @@ public class VoiceTimerService(
 
             // Track whether Ready fires during or after StartAsync.
             var readyTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            _voiceClient.Ready += () =>
+            state.VoiceClient.Ready += () =>
             {
                 logger.LogInformation("VoiceTimer: [Ready] event fired");
                 readyTcs.TrySetResult();
@@ -72,7 +72,7 @@ public class VoiceTimerService(
             // Wrap it in a 20-second timeout so a silent hang surfaces as a real error.
             try
             {
-                await _voiceClient.StartAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(20), cancellationToken);
+                await state.VoiceClient.StartAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(20), cancellationToken);
             }
             catch (TimeoutException)
             {
@@ -103,99 +103,101 @@ public class VoiceTimerService(
 
             logger.LogInformation("VoiceTimer: [5] Entering speaking state");
 
-            await _voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: cancellationToken);
+            await state.VoiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: cancellationToken);
 
             logger.LogInformation("VoiceTimer: [6] Creating voice stream and starting timer loop");
 
-            _voiceStream = _voiceClient.CreateVoiceStream(new VoiceStreamConfiguration
+            state.VoiceStream = state.VoiceClient.CreateVoiceStream(new VoiceStreamConfiguration
             {
                 NormalizeSpeed = true
             });
 
-            _voiceCloseHandler = OnVoiceClientClosedAsync;
-            _voiceClient.Close += _voiceCloseHandler;
+            state.VoiceCloseHandler = () => OnVoiceClientClosedAsync(state);
+            state.VoiceClient.Close += state.VoiceCloseHandler;
 
-            _timerTask = Task.Run(() => RunLoopAsync(token), CancellationToken.None);
+            state.TimerTask = Task.Run(() => RunLoopAsync(state, token), CancellationToken.None);
 
             logger.LogInformation("VoiceTimer: [6] Timer loop started");
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "VoiceTimer: StartAsync failed");
-            await StopCoreAsync();
+            logger.LogError(ex, "VoiceTimer: StartAsync failed (guild={GuildId})", guildId);
+            await StopCoreAsync(state);
             throw;
         }
         finally
         {
-            _lock.Release();
+            state.Lock.Release();
         }
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken = default)
+    public async Task StopAsync(ulong guildId, CancellationToken cancellationToken = default)
     {
-        await _lock.WaitAsync(cancellationToken);
+        var state = _guilds[guildId];
+
+        await state.Lock.WaitAsync(cancellationToken);
         try
         {
-            await StopCoreAsync();
+            await StopCoreAsync(state);
         }
         finally
         {
-            _lock.Release();
+            state.Lock.Release();
         }
     }
 
-    private async Task StopCoreAsync()
+    private async Task StopCoreAsync(GuildTimerState state)
     {
-        if (_cts is not null)
+        if (state.Cts is not null)
         {
-            await _cts.CancelAsync();
-            _cts.Dispose();
-            _cts = null;
+            await state.Cts.CancelAsync();
+            state.Cts.Dispose();
+            state.Cts = null;
         }
 
-        if (_timerTask is not null)
+        if (state.TimerTask is not null)
         {
-            try { await _timerTask.WaitAsync(TimeSpan.FromSeconds(10)); }
+            try { await state.TimerTask.WaitAsync(TimeSpan.FromSeconds(10)); }
             catch { /* cancellation or timeout — expected */ }
-            _timerTask = null;
+            state.TimerTask = null;
         }
 
-        if (_voiceStream is not null)
+        if (state.VoiceStream is not null)
         {
-            try { await _voiceStream.DisposeAsync(); } catch { /* ignore */ }
-            _voiceStream = null;
+            try { await state.VoiceStream.DisposeAsync(); } catch { /* ignore */ }
+            state.VoiceStream = null;
         }
 
-        var hadClient = _voiceClient is not null;
+        var hadClient = state.VoiceClient is not null;
 
-        if (_voiceClient is not null)
+        if (state.VoiceClient is not null)
         {
-            if (_voiceCloseHandler is not null)
-                _voiceClient.Close -= _voiceCloseHandler;
-            try { _voiceClient.Dispose(); } catch { /* ignore */ }
-            _voiceClient = null;
+            if (state.VoiceCloseHandler is not null)
+                state.VoiceClient.Close -= state.VoiceCloseHandler;
+            try { state.VoiceClient.Dispose(); } catch { /* ignore */ }
+            state.VoiceClient = null;
         }
 
-        _voiceCloseHandler = null;
+        state.VoiceCloseHandler = null;
 
         if (!hadClient)
             return;
 
         try
         {
-            await gatewayClient.UpdateVoiceStateAsync(new VoiceStateProperties(_settings.GuildId, null));
+            await gatewayClient.UpdateVoiceStateAsync(new VoiceStateProperties(state.Settings.GuildId, null));
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "VoiceTimer: Failed to send voice leave state to Discord");
+            logger.LogWarning(ex, "VoiceTimer: Failed to send voice leave state to Discord (guild={GuildId})", state.Settings.GuildId);
         }
     }
 
-    private async Task RunLoopAsync(CancellationToken ct)
+    private async Task RunLoopAsync(GuildTimerState state, CancellationToken ct)
     {
         try
         {
-            await PlayClipAsync(_settings.StartClipPath, ct);
+            await PlayClipAsync(state, state.Settings.StartClipPath, ct);
 
             var startTime = DateTimeOffset.UtcNow;
             var spawnElapsed = FirstSpawnElapsed;
@@ -203,17 +205,17 @@ public class VoiceTimerService(
             while (spawnElapsed <= TotalDuration)
             {
                 await WaitUntilAsync(startTime + spawnElapsed - Warn40s, ct);
-                await PlayClipAsync(_settings.Warn40s, ct);
+                await PlayClipAsync(state, state.Settings.Warn40s, ct);
 
                 await WaitUntilAsync(startTime + spawnElapsed - Warn20s, ct);
-                await PlayClipAsync(_settings.Warn20s, ct);
+                await PlayClipAsync(state, state.Settings.Warn20s, ct);
 
                 spawnElapsed += SpawnInterval;
             }
 
-            // Natural end at 0:00 — disconnect without deadlocking on _timerTask.
-            logger.LogInformation("VoiceTimer: Timer reached 0:00, disconnecting");
-            await CleanupVoiceAsync();
+            // Natural end at 0:00 — disconnect without deadlocking on TimerTask.
+            logger.LogInformation("VoiceTimer: Timer reached 0:00, disconnecting (guild={GuildId})", state.Settings.GuildId);
+            await CleanupVoiceAsync(state);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -221,7 +223,7 @@ public class VoiceTimerService(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "VoiceTimer: Timer loop encountered an unhandled error");
+            logger.LogError(ex, "VoiceTimer: Timer loop encountered an unhandled error (guild={GuildId})", state.Settings.GuildId);
         }
     }
 
@@ -232,96 +234,96 @@ public class VoiceTimerService(
             await Task.Delay(remaining, ct);
     }
 
-    private async Task CleanupVoiceAsync()
+    private async Task CleanupVoiceAsync(GuildTimerState state)
     {
-        if (_voiceStream is not null)
+        if (state.VoiceStream is not null)
         {
-            try { await _voiceStream.DisposeAsync(); } catch { /* ignore */ }
-            _voiceStream = null;
+            try { await state.VoiceStream.DisposeAsync(); } catch { /* ignore */ }
+            state.VoiceStream = null;
         }
 
-        if (_voiceClient is not null)
+        if (state.VoiceClient is not null)
         {
-            if (_voiceCloseHandler is not null)
-                _voiceClient.Close -= _voiceCloseHandler;
-            try { _voiceClient.Dispose(); } catch { /* ignore */ }
-            _voiceClient = null;
+            if (state.VoiceCloseHandler is not null)
+                state.VoiceClient.Close -= state.VoiceCloseHandler;
+            try { state.VoiceClient.Dispose(); } catch { /* ignore */ }
+            state.VoiceClient = null;
         }
 
-        _voiceCloseHandler = null;
+        state.VoiceCloseHandler = null;
 
         try
         {
-            await gatewayClient.UpdateVoiceStateAsync(new VoiceStateProperties(_settings.GuildId, null));
+            await gatewayClient.UpdateVoiceStateAsync(new VoiceStateProperties(state.Settings.GuildId, null));
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "VoiceTimer: Failed to send voice leave state to Discord");
+            logger.LogWarning(ex, "VoiceTimer: Failed to send voice leave state to Discord (guild={GuildId})", state.Settings.GuildId);
         }
     }
 
-    private ValueTask OnVoiceClientClosedAsync()
+    private ValueTask OnVoiceClientClosedAsync(GuildTimerState state)
     {
-        if (_cts is null || _cts.IsCancellationRequested) return ValueTask.CompletedTask;
-        logger.LogWarning("VoiceTimer: Voice connection closed unexpectedly — scheduling reconnect");
-        _ = Task.Run(ReconnectVoiceAsync);
+        if (state.Cts is null || state.Cts.IsCancellationRequested) return ValueTask.CompletedTask;
+        logger.LogWarning("VoiceTimer: Voice connection closed unexpectedly (guild={GuildId}) — scheduling reconnect", state.Settings.GuildId);
+        _ = Task.Run(() => ReconnectVoiceAsync(state));
         return ValueTask.CompletedTask;
     }
 
-    private async Task ReconnectVoiceAsync()
+    private async Task ReconnectVoiceAsync(GuildTimerState state)
     {
-        if (_cts is null || _cts.IsCancellationRequested) return;
+        if (state.Cts is null || state.Cts.IsCancellationRequested) return;
 
-        await _lock.WaitAsync();
+        await state.Lock.WaitAsync();
         try
         {
-            if (_cts is null || _cts.IsCancellationRequested) return;
-            var token = _cts.Token;
+            if (state.Cts is null || state.Cts.IsCancellationRequested) return;
+            var token = state.Cts.Token;
 
-            logger.LogInformation("VoiceTimer: Re-establishing voice connection after disconnect");
+            logger.LogInformation("VoiceTimer: Re-establishing voice connection after disconnect (guild={GuildId})", state.Settings.GuildId);
 
-            if (_voiceStream is not null)
+            if (state.VoiceStream is not null)
             {
-                try { await _voiceStream.DisposeAsync(); } catch { /* ignore */ }
-                _voiceStream = null;
+                try { await state.VoiceStream.DisposeAsync(); } catch { /* ignore */ }
+                state.VoiceStream = null;
             }
 
-            if (_voiceClient is not null)
+            if (state.VoiceClient is not null)
             {
                 // Handler already fired — it's closed, no need to unsubscribe
-                try { _voiceClient.Dispose(); } catch { /* ignore */ }
-                _voiceClient = null;
+                try { state.VoiceClient.Dispose(); } catch { /* ignore */ }
+                state.VoiceClient = null;
             }
 
             await Task.Delay(TimeSpan.FromSeconds(3), token);
 
-            _voiceClient = await gatewayClient.JoinVoiceChannelAsync(
-                _settings.GuildId, _settings.ChannelId, new VoiceClientConfiguration(), token);
+            state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
+                state.Settings.GuildId, state.Settings.ChannelId, new VoiceClientConfiguration(), token);
 
             var readyTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            _voiceClient.Ready += () =>
+            state.VoiceClient.Ready += () =>
             {
-                logger.LogInformation("VoiceTimer: [Reconnect][Ready] fired");
+                logger.LogInformation("VoiceTimer: [Reconnect][Ready] fired (guild={GuildId})", state.Settings.GuildId);
                 readyTcs.TrySetResult();
                 return ValueTask.CompletedTask;
             };
 
-            await _voiceClient.StartAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(20), token);
+            await state.VoiceClient.StartAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(20), token);
 
             if (!readyTcs.Task.IsCompleted)
             {
                 try { await readyTcs.Task.WaitAsync(TimeSpan.FromSeconds(5), token); }
-                catch (TimeoutException) { logger.LogWarning("VoiceTimer: Ready event did not fire after voice reconnect"); }
+                catch (TimeoutException) { logger.LogWarning("VoiceTimer: Ready event did not fire after voice reconnect (guild={GuildId})", state.Settings.GuildId); }
             }
 
-            await _voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: token);
+            await state.VoiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: token);
 
-            _voiceStream = _voiceClient.CreateVoiceStream(new VoiceStreamConfiguration { NormalizeSpeed = true });
+            state.VoiceStream = state.VoiceClient.CreateVoiceStream(new VoiceStreamConfiguration { NormalizeSpeed = true });
 
-            _voiceCloseHandler = OnVoiceClientClosedAsync;
-            _voiceClient.Close += _voiceCloseHandler;
+            state.VoiceCloseHandler = () => OnVoiceClientClosedAsync(state);
+            state.VoiceClient.Close += state.VoiceCloseHandler;
 
-            logger.LogInformation("VoiceTimer: Voice reconnected successfully");
+            logger.LogInformation("VoiceTimer: Voice reconnected successfully (guild={GuildId})", state.Settings.GuildId);
         }
         catch (OperationCanceledException)
         {
@@ -329,29 +331,29 @@ public class VoiceTimerService(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "VoiceTimer: Failed to reconnect voice");
+            logger.LogError(ex, "VoiceTimer: Failed to reconnect voice (guild={GuildId})", state.Settings.GuildId);
         }
         finally
         {
-            _lock.Release();
+            state.Lock.Release();
         }
     }
 
-    private async Task SendSilenceFramesAsync(int count, CancellationToken ct)
+    private async Task SendSilenceFramesAsync(GuildTimerState state, int count, CancellationToken ct)
     {
-        if (_voiceStream is null) return;
+        if (state.VoiceStream is null) return;
         await using var enc = new OpusEncodeStream(
-            _voiceStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio,
+            state.VoiceStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio,
             new OpusEncodeStreamConfiguration { FrameDuration = 20.0f }, leaveOpen: true);
         for (var i = 0; i < count; i++)
             await enc.WriteAsync(SilencePcmFrame, ct);
     }
 
-    private async Task PlayClipAsync(string filePath, CancellationToken ct)
+    private async Task PlayClipAsync(GuildTimerState state, string filePath, CancellationToken ct)
     {
-        if (_voiceStream is null)
+        if (state.VoiceStream is null)
         {
-            logger.LogWarning("VoiceTimer: Skipping clip — voice stream is null");
+            logger.LogWarning("VoiceTimer: Skipping clip — voice stream is null (guild={GuildId})", state.Settings.GuildId);
             return;
         }
 
@@ -361,10 +363,10 @@ public class VoiceTimerService(
             return;
         }
 
-        if (_voiceClient is not null)
-            await _voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: ct);
+        if (state.VoiceClient is not null)
+            await state.VoiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: ct);
 
-        await SendSilenceFramesAsync(5, ct);
+        await SendSilenceFramesAsync(state, 5, ct);
 
         Process ffmpeg;
         try
@@ -399,7 +401,7 @@ public class VoiceTimerService(
                 try
                 {
                     await using var encodeStream = new OpusEncodeStream(
-                        _voiceStream,
+                        state.VoiceStream,
                         PcmFormat.Short,
                         VoiceChannels.Stereo,
                         OpusApplication.Audio,
@@ -437,8 +439,26 @@ public class VoiceTimerService(
 
     public async ValueTask DisposeAsync()
     {
-        await StopCoreAsync();
-        _lock.Dispose();
+        foreach (var state in _guilds.Values)
+        {
+            await state.Lock.WaitAsync();
+            try { await StopCoreAsync(state); }
+            finally { state.Lock.Release(); }
+            state.Lock.Dispose();
+        }
+    }
+
+    private sealed class GuildTimerState(VoiceTimerGuildSettings settings)
+    {
+        public VoiceTimerGuildSettings Settings { get; } = settings;
+        public SemaphoreSlim Lock { get; } = new(1, 1);
+        public VoiceClient? VoiceClient;
+        public Stream? VoiceStream;
+        public CancellationTokenSource? Cts;
+        public Task? TimerTask;
+        public Func<ValueTask>? VoiceCloseHandler;
+
+        public bool IsRunning => TimerTask is { IsCompleted: false };
     }
 }
 

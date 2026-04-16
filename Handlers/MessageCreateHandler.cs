@@ -1,16 +1,17 @@
 using JetBrains.Annotations;
-using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 using NetCord.Gateway;
 using NetCord.Hosting.Gateway;
 using NetCord.Rest;
 using VoiceTimerBot.Interfaces;
+using VoiceTimerBot.Services;
 
 namespace VoiceTimerBot.Handlers;
 
 [UsedImplicitly]
 public class MessageCreateHandler(
     IVoiceTimerService voiceTimerService,
-    IConfiguration configuration,
+    IOptions<VoiceTimerSettings> options,
     RestClient restClient)
     : IMessageCreateGatewayHandler
 {
@@ -38,53 +39,74 @@ public class MessageCreateHandler(
 
     private async Task HandleStartTimerAsync(Message message)
     {
-        if (!await IsCouncilMemberAsync(message.GuildId, message.Author.Id))
+        if (message.GuildId is null) return;
+        var guildId = message.GuildId.Value;
+
+        if (!voiceTimerService.IsConfigured(guildId))
         {
-            await restClient.SendMessageAsync(message.ChannelId, new MessageProperties().WithContent("You do not have permission to use this command."));
+            await SendAsync(message.ChannelId, "This server is not configured for the jungle timer.");
+            return;
+        }
+
+        if (!await IsAuthorizedAsync(guildId, message.Author.Id))
+        {
+            await SendAsync(message.ChannelId, "You do not have permission to use this command.");
             return;
         }
 
         try
         {
-            await voiceTimerService.StartAsync();
-            await restClient.SendMessageAsync(message.ChannelId, new MessageProperties().WithContent("Timer started."));
+            await voiceTimerService.StartAsync(guildId);
+            await SendAsync(message.ChannelId, "Timer started.");
         }
         catch (Exception ex)
         {
-            await restClient.SendMessageAsync(message.ChannelId, new MessageProperties().WithContent($"Failed to start the timer: {ex.GetType().Name}: {ex.Message}"));
+            await SendAsync(message.ChannelId, $"Failed to start the timer: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
     private async Task HandleStopTimerAsync(Message message)
     {
-        if (!await IsCouncilMemberAsync(message.GuildId, message.Author.Id))
+        if (message.GuildId is null) return;
+        var guildId = message.GuildId.Value;
+
+        if (!voiceTimerService.IsConfigured(guildId))
         {
-            await restClient.SendMessageAsync(message.ChannelId, new MessageProperties().WithContent("You do not have permission to use this command."));
+            await SendAsync(message.ChannelId, "This server is not configured for the jungle timer.");
             return;
         }
 
-        if (!voiceTimerService.IsRunning)
+        if (!await IsAuthorizedAsync(guildId, message.Author.Id))
         {
-            await restClient.SendMessageAsync(message.ChannelId, new MessageProperties().WithContent("The timer is not running."));
+            await SendAsync(message.ChannelId, "You do not have permission to use this command.");
+            return;
+        }
+
+        if (!voiceTimerService.IsRunning(guildId))
+        {
+            await SendAsync(message.ChannelId, "The timer is not running.");
             return;
         }
 
         try
         {
-            await voiceTimerService.StopAsync();
-            await restClient.SendMessageAsync(message.ChannelId, new MessageProperties().WithContent("Timer stopped and bot disconnected."));
+            await voiceTimerService.StopAsync(guildId);
+            await SendAsync(message.ChannelId, "Timer stopped and bot disconnected.");
         }
         catch (Exception ex)
         {
-            await restClient.SendMessageAsync(message.ChannelId, new MessageProperties().WithContent($"Failed to stop the timer: {ex.GetType().Name}: {ex.Message}"));
+            await SendAsync(message.ChannelId, $"Failed to stop the timer: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
-    private async Task<bool> IsCouncilMemberAsync(ulong? guildId, ulong userId)
+    private async Task<bool> IsAuthorizedAsync(ulong guildId, ulong userId)
     {
-        if (guildId is null) return false;
-        var councilRoles = configuration.GetSection("CouncilRole").Get<ulong[]>() ?? [];
-        var member = await restClient.GetGuildUserAsync(guildId.Value, userId);
-        return member.RoleIds.Any(r => councilRoles.Contains(r));
+        var guildSettings = options.Value.Servers.FirstOrDefault(s => s.GuildId == guildId);
+        if (guildSettings is null) return false;
+        var member = await restClient.GetGuildUserAsync(guildId, userId);
+        return member.RoleIds.Contains(guildSettings.AuthorizedRoleId);
     }
+
+    private Task SendAsync(ulong channelId, string content) =>
+        restClient.SendMessageAsync(channelId, new MessageProperties().WithContent(content));
 }

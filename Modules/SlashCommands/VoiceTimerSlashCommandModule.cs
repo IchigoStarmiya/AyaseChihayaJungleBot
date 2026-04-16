@@ -1,21 +1,35 @@
 using JetBrains.Annotations;
-using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 using NetCord;
 using NetCord.Rest;
 using NetCord.Services.ApplicationCommands;
 using VoiceTimerBot.Interfaces;
+using VoiceTimerBot.Services;
 
 namespace VoiceTimerBot.Modules.SlashCommands;
 
 [UsedImplicitly]
-public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, IConfiguration configuration, RestClient restClient)
+public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, IOptions<VoiceTimerSettings> options, RestClient restClient)
     : ApplicationCommandModule<ApplicationCommandContext>
 {
     [SlashCommand("starttimer", "Start (or reset) the voice channel timer")]
     [UsedImplicitly]
     public async Task StartTimer()
     {
-        if (!await IsCouncilMemberAsync())
+        var guildId = Context.Interaction.GuildId;
+        if (guildId is null)
+        {
+            await RespondEphemeralAsync("This command must be used in a server.");
+            return;
+        }
+
+        if (!voiceTimerService.IsConfigured(guildId.Value))
+        {
+            await RespondEphemeralAsync("This server is not configured for the jungle timer.");
+            return;
+        }
+
+        if (!await IsAuthorizedAsync(guildId.Value))
         {
             await RespondEphemeralAsync("You do not have permission to use this command.");
             return;
@@ -25,7 +39,7 @@ public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, 
 
         try
         {
-            await voiceTimerService.StartAsync();
+            await voiceTimerService.StartAsync(guildId.Value);
             await Context.Interaction.ModifyResponseAsync(m => m.WithContent("Timer started."));
         }
         catch (Exception ex)
@@ -39,7 +53,20 @@ public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, 
     [UsedImplicitly]
     public async Task StopTimer()
     {
-        if (!await IsCouncilMemberAsync())
+        var guildId = Context.Interaction.GuildId;
+        if (guildId is null)
+        {
+            await RespondEphemeralAsync("This command must be used in a server.");
+            return;
+        }
+
+        if (!voiceTimerService.IsConfigured(guildId.Value))
+        {
+            await RespondEphemeralAsync("This server is not configured for the jungle timer.");
+            return;
+        }
+
+        if (!await IsAuthorizedAsync(guildId.Value))
         {
             await RespondEphemeralAsync("You do not have permission to use this command.");
             return;
@@ -47,7 +74,7 @@ public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, 
 
         await Context.Interaction.SendResponseAsync(InteractionCallback.DeferredMessage(MessageFlags.Ephemeral));
 
-        if (!voiceTimerService.IsRunning)
+        if (!voiceTimerService.IsRunning(guildId.Value))
         {
             await Context.Interaction.ModifyResponseAsync(m => m.WithContent("The timer is not running."));
             return;
@@ -55,7 +82,7 @@ public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, 
 
         try
         {
-            await voiceTimerService.StopAsync();
+            await voiceTimerService.StopAsync(guildId.Value);
             await Context.Interaction.ModifyResponseAsync(m => m.WithContent("Timer stopped and bot disconnected."));
         }
         catch (Exception ex)
@@ -65,13 +92,12 @@ public class VoiceTimerSlashCommandModule(IVoiceTimerService voiceTimerService, 
         }
     }
 
-    private async Task<bool> IsCouncilMemberAsync()
+    private async Task<bool> IsAuthorizedAsync(ulong guildId)
     {
-        var guildId = Context.Interaction.GuildId;
-        if (guildId is null) return false;
-        var councilRoles = configuration.GetSection("CouncilRole").Get<ulong[]>() ?? [];
-        var member = await restClient.GetGuildUserAsync(guildId.Value, Context.User.Id);
-        return member.RoleIds.Any(r => councilRoles.Contains(r));
+        var guildSettings = options.Value.Servers.FirstOrDefault(s => s.GuildId == guildId);
+        if (guildSettings is null) return false;
+        var member = await restClient.GetGuildUserAsync(guildId, Context.User.Id);
+        return member.RoleIds.Contains(guildSettings.AuthorizedRoleId);
     }
 
     private Task RespondEphemeralAsync(string content) =>

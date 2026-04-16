@@ -3,13 +3,32 @@
     "Token": "YOUR TOKEN HERE"
   },
   "VoiceTimer": {
-    "GuildId": 0,
-    "ChannelId": 0,
-    "StartClipPath": "Audio/jungle.ogg",
-    "Warn40s": "Audio/respawn40.mp3",
-    "Warn20s": "Audio/respawn20.mp3",
-    "MaiJungle": "Audio/jungle.ogg",
-    "FfmpegPath": "ffmpeg"
-  },
-  "CouncilRole": [0]
+    "FfmpegPath": "ffmpeg",
+    "Servers": [
+      {
+        "GuildId": 897508084619034704,
+        "ChannelId": 1462166549053047066,
+        "AuthorizedRoleId": 1468711942461063200,
+        "StartClipPath": "Audio/junglebot.mp3",
+        "Warn40s": "Audio/respawn40.mp3",
+        "Warn20s": "Audio/respawn20.mp3"
+      },
+      {
+        "GuildId": 1429191473181491304,
+        "ChannelId": 1481362925770772713,
+        "AuthorizedRoleId": 1444419209772666962,
+        "StartClipPath": "Audio/junglebot.mp3",
+        "Warn40s": "Audio/respawn40.mp3",
+        "Warn20s": "Audio/respawn20.mp3"
+      },
+      {
+        "GuildId": 386933744025468939,
+        "ChannelId": 386933744025468943,
+        "AuthorizedRoleId": 401363878820446208,
+        "StartClipPath": "Audio/junglebot.mp3",
+        "Warn40s": "Audio/respawn40.mp3",
+        "Warn20s": "Audio/respawn20.mp3"
+      }
+    ]
+  }
 }
