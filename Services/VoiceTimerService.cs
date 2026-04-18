@@ -374,7 +374,7 @@ public class VoiceTimerService(
             ffmpeg = Process.Start(new ProcessStartInfo
             {
                 FileName = _settings.FfmpegPath,
-                Arguments = $"-hide_banner -loglevel error -i \"{filePath}\" -af volume=2 -ac 2 -ar 48000 -f s16le pipe:1",
+                Arguments = $"-hide_banner -loglevel error -i \"{filePath}\" -af loudnorm=I=-5,volume=2 -ac 2 -ar 48000 -f s16le pipe:1",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
