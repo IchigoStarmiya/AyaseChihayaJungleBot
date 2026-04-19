@@ -213,8 +213,10 @@ public class VoiceTimerService(
                 spawnElapsed += SpawnInterval;
             }
 
-            // Natural end after last jungle spawn — disconnect without deadlocking on TimerTask.
-            logger.LogInformation("VoiceTimer: Last jungle spawn warned, disconnecting (guild={GuildId})", state.Settings.GuildId);
+            // Natural end after last jungle spawn — wait for Discord's jitter buffer to drain before disconnecting.
+            logger.LogInformation("VoiceTimer: Last jungle spawn warned, waiting for audio to finish (guild={GuildId})", state.Settings.GuildId);
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            logger.LogInformation("VoiceTimer: Disconnecting (guild={GuildId})", state.Settings.GuildId);
             await CleanupVoiceAsync(state);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
