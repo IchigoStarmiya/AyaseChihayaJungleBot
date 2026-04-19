@@ -16,7 +16,7 @@ public class VoiceTimerService(
     // 20 ms of silence at 48 kHz stereo 16-bit PCM (48000 * 2 channels * 2 bytes * 0.02 s).
     private static readonly byte[] SilencePcmFrame = new byte[3840];
 
-    private static readonly TimeSpan TotalDuration = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan TotalDuration = TimeSpan.FromMinutes(25);
     private static readonly TimeSpan SpawnInterval = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan FirstSpawnElapsed = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan Warn40s = TimeSpan.FromSeconds(40);
@@ -213,8 +213,8 @@ public class VoiceTimerService(
                 spawnElapsed += SpawnInterval;
             }
 
-            // Natural end at 0:00 — disconnect without deadlocking on TimerTask.
-            logger.LogInformation("VoiceTimer: Timer reached 0:00, disconnecting (guild={GuildId})", state.Settings.GuildId);
+            // Natural end after last jungle spawn — disconnect without deadlocking on TimerTask.
+            logger.LogInformation("VoiceTimer: Last jungle spawn warned, disconnecting (guild={GuildId})", state.Settings.GuildId);
             await CleanupVoiceAsync(state);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
