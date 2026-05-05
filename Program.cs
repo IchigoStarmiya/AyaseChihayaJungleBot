@@ -13,7 +13,7 @@ var builder = Host.CreateApplicationBuilder(args);
 
 builder.Logging.AddSentry(options =>
 {
-    options.Dsn = builder.Configuration["Dsn"];
+    options.Dsn = builder.Configuration["Dsn"] ?? string.Empty;
     options.MinimumEventLevel = LogLevel.Error;
     options.Environment = builder.Environment.EnvironmentName;
     options.AutoSessionTracking = true;
