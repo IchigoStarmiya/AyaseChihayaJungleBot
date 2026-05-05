@@ -2,6 +2,7 @@
   "Discord": {
     "Token": "YOUR TOKEN HERE"
   },
+  "Dsn": "",
   "VoiceTimer": {
     "FfmpegPath": "ffmpeg",
     "Servers": [
