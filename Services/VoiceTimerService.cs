@@ -69,13 +69,13 @@ public class VoiceTimerService(
                 _voiceJoinGate.Release();
             }
 
-            logger.LogInformation("VoiceTimer: [2] JoinVoiceChannelAsync returned — calling StartAsync");
+            logger.LogInformation("VoiceTimer: [2] JoinVoiceChannelAsync returned — calling StartAsync (guild={GuildId})", state.Settings.GuildId);
 
             // Track whether Ready fires during or after StartAsync.
             var readyTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             state.VoiceClient.Ready += () =>
             {
-                logger.LogInformation("VoiceTimer: [Ready] event fired");
+                logger.LogInformation("VoiceTimer: [Ready] event fired (guild={GuildId})", state.Settings.GuildId);
                 readyTcs.TrySetResult();
                 return ValueTask.CompletedTask;
             };
@@ -93,31 +93,31 @@ public class VoiceTimerService(
                     "The bot likely cannot reach Discord's voice servers — check outbound UDP/WSS connectivity.");
             }
 
-            logger.LogInformation("VoiceTimer: [3] StartAsync returned");
+            logger.LogInformation("VoiceTimer: [3] StartAsync returned (guild={GuildId})", state.Settings.GuildId);
 
             // If Ready has not fired yet, wait up to 5 more seconds for it.
             if (!readyTcs.Task.IsCompleted)
             {
-                logger.LogInformation("VoiceTimer: [4] Ready not yet fired — waiting up to 5 s");
+                logger.LogInformation("VoiceTimer: [4] Ready not yet fired — waiting up to 5 s (guild={GuildId})", state.Settings.GuildId);
                 try
                 {
                     await readyTcs.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
                 }
                 catch (TimeoutException)
                 {
-                    logger.LogWarning("VoiceTimer: Ready event did not fire after StartAsync — proceeding anyway");
+                    logger.LogWarning("VoiceTimer: Ready event did not fire after StartAsync — proceeding anyway (guild={GuildId})", state.Settings.GuildId);
                 }
             }
             else
             {
-                logger.LogInformation("VoiceTimer: [4] Ready had already fired during StartAsync");
+                logger.LogInformation("VoiceTimer: [4] Ready had already fired during StartAsync (guild={GuildId})", state.Settings.GuildId);
             }
 
-            logger.LogInformation("VoiceTimer: [5] Entering speaking state");
+            logger.LogInformation("VoiceTimer: [5] Entering speaking state (guild={GuildId})", state.Settings.GuildId);
 
             await state.VoiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: cancellationToken);
 
-            logger.LogInformation("VoiceTimer: [6] Creating voice stream and starting timer loop");
+            logger.LogInformation("VoiceTimer: [6] Creating voice stream and starting timer loop (guild={GuildId})", state.Settings.GuildId);
 
             state.VoiceStream = state.VoiceClient.CreateVoiceStream(new VoiceStreamConfiguration
             {
@@ -129,7 +129,7 @@ public class VoiceTimerService(
 
             state.TimerTask = Task.Run(() => RunLoopAsync(state, token), CancellationToken.None);
 
-            logger.LogInformation("VoiceTimer: [6] Timer loop started");
+            logger.LogInformation("VoiceTimer: [6] Timer loop started (guild={GuildId})", state.Settings.GuildId);
         }
         catch (Exception ex)
         {
@@ -207,28 +207,35 @@ public class VoiceTimerService(
 
     private async Task RunLoopAsync(GuildTimerState state, CancellationToken ct)
     {
+        var guildId = state.Settings.GuildId;
         try
         {
             await PlayClipAsync(state, state.Settings.StartClipPath, ct);
 
-            var startTime = DateTimeOffset.UtcNow;
+            // Monotonic clock — immune to wall-clock adjustments (NTP, DST, VM time skew)
+            // that DateTimeOffset.UtcNow would expose us to over a 25-minute window.
+            var clock = Stopwatch.StartNew();
             var spawnElapsed = FirstSpawnElapsed;
 
             while (spawnElapsed <= TotalDuration)
             {
-                await WaitUntilAsync(startTime + spawnElapsed - Warn40s, ct);
+                var warn40Target = spawnElapsed - Warn40s;
+                await WaitUntilAsync(clock, warn40Target, ct);
+                LogDrift("warn40", clock, warn40Target, guildId);
                 await PlayClipAsync(state, state.Settings.Warn40s, ct);
 
-                await WaitUntilAsync(startTime + spawnElapsed - Warn20s, ct);
+                var warn20Target = spawnElapsed - Warn20s;
+                await WaitUntilAsync(clock, warn20Target, ct);
+                LogDrift("warn20", clock, warn20Target, guildId);
                 await PlayClipAsync(state, state.Settings.Warn20s, ct);
 
                 spawnElapsed += SpawnInterval;
             }
 
             // Natural end after last jungle spawn — wait for Discord's jitter buffer to drain before disconnecting.
-            logger.LogInformation("VoiceTimer: Last jungle spawn warned, waiting for audio to finish (guild={GuildId})", state.Settings.GuildId);
+            logger.LogInformation("VoiceTimer: Last jungle spawn warned, waiting for audio to finish (guild={GuildId})", guildId);
             await Task.Delay(TimeSpan.FromSeconds(5), ct);
-            logger.LogInformation("VoiceTimer: Disconnecting (guild={GuildId})", state.Settings.GuildId);
+            logger.LogInformation("VoiceTimer: Disconnecting (guild={GuildId})", guildId);
             await CleanupVoiceAsync(state);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -237,15 +244,23 @@ public class VoiceTimerService(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "VoiceTimer: Timer loop encountered an unhandled error (guild={GuildId})", state.Settings.GuildId);
+            logger.LogError(ex, "VoiceTimer: Timer loop encountered an unhandled error (guild={GuildId})", guildId);
         }
     }
 
-    private static async Task WaitUntilAsync(DateTimeOffset target, CancellationToken ct)
+    private static async Task WaitUntilAsync(Stopwatch clock, TimeSpan target, CancellationToken ct)
     {
-        var remaining = target - DateTimeOffset.UtcNow;
+        var remaining = target - clock.Elapsed;
         if (remaining > TimeSpan.Zero)
             await Task.Delay(remaining, ct);
+    }
+
+    private void LogDrift(string label, Stopwatch clock, TimeSpan target, ulong guildId)
+    {
+        var driftMs = (long)(clock.Elapsed - target).TotalMilliseconds;
+        logger.LogInformation(
+            "VoiceTimer: Firing {Label} elapsed={Elapsed:c} target={Target:c} drift={DriftMs}ms (guild={GuildId})",
+            label, clock.Elapsed, target, driftMs, guildId);
     }
 
     private async Task CleanupVoiceAsync(GuildTimerState state)
@@ -365,17 +380,10 @@ public class VoiceTimerService(
         }
     }
 
-    private static async Task SendSilenceFramesAsync(Stream voiceStream, int count, CancellationToken ct)
-    {
-        await using var enc = new OpusEncodeStream(
-            voiceStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio,
-            new OpusEncodeStreamConfiguration { FrameDuration = 20.0f }, leaveOpen: true);
-        for (var i = 0; i < count; i++)
-            await enc.WriteAsync(SilencePcmFrame, ct);
-    }
-
     private async Task PlayClipAsync(GuildTimerState state, string filePath, CancellationToken ct)
     {
+        var guildId = state.Settings.GuildId;
+
         // Snapshot both references before any await so a concurrent ReconnectVoiceAsync cannot
         // dispose+replace them between our null-check and our first write to the stream.
         var voiceStream = state.VoiceStream;
@@ -383,20 +391,18 @@ public class VoiceTimerService(
 
         if (voiceStream is null)
         {
-            logger.LogWarning("VoiceTimer: Skipping clip — voice stream is null (guild={GuildId})", state.Settings.GuildId);
+            logger.LogWarning("VoiceTimer: Skipping clip — voice stream is null (guild={GuildId})", guildId);
             return;
         }
 
         if (!File.Exists(filePath))
         {
-            logger.LogWarning("VoiceTimer: Audio file not found, skipping: {FilePath}", filePath);
+            logger.LogWarning("VoiceTimer: Audio file not found, skipping: {FilePath} (guild={GuildId})", filePath, guildId);
             return;
         }
 
         if (voiceClient is not null)
             await voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: ct);
-
-        await SendSilenceFramesAsync(voiceStream, 5, ct);
 
         Process ffmpeg;
         try
@@ -413,7 +419,7 @@ public class VoiceTimerService(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "VoiceTimer: Failed to start FFmpeg for {FilePath}", filePath);
+            logger.LogError(ex, "VoiceTimer: Failed to start FFmpeg for {FilePath} (guild={GuildId})", filePath, guildId);
             return;
         }
 
@@ -430,6 +436,9 @@ public class VoiceTimerService(
 
                 try
                 {
+                    // One encoder per clip — covers both the silence prefix and the audio body.
+                    // Avoids the previous design's two encoder lifecycles per clip, which churned
+                    // Opus encoder state and added unnecessary CPU + GC pressure between guilds.
                     await using var encodeStream = new OpusEncodeStream(
                         voiceStream,
                         PcmFormat.Short,
@@ -438,10 +447,17 @@ public class VoiceTimerService(
                         new OpusEncodeStreamConfiguration { FrameDuration = 20.0f },
                         leaveOpen: true);
 
+                    // Silence prefix gives Discord's jitter buffer a head start and prevents the
+                    // previous transmission's Opus tail from interpolating into this clip.
+                    for (var i = 0; i < 5; i++)
+                        await encodeStream.WriteAsync(SilencePcmFrame, ct);
+
                     var countingStream = new ByteCountingStream(ffmpeg.StandardOutput.BaseStream);
                     await countingStream.CopyToAsync(encodeStream, ct);
 
-                    logger.LogInformation("VoiceTimer: Finished streaming {FilePath} ({Bytes} PCM bytes)", filePath, countingStream.BytesRead);
+                    logger.LogInformation(
+                        "VoiceTimer: Finished streaming {FilePath} ({Bytes} PCM bytes) (guild={GuildId})",
+                        filePath, countingStream.BytesRead, guildId);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -449,15 +465,15 @@ public class VoiceTimerService(
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "VoiceTimer: Error while streaming audio from {FilePath}", filePath);
+                    logger.LogError(ex, "VoiceTimer: Error while streaming audio from {FilePath} (guild={GuildId})", filePath, guildId);
                 }
                 finally
                 {
                     try { await ffmpeg.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)); } catch { /* ignore */ }
                     var stderr = await stderrTask;
                     if (!string.IsNullOrWhiteSpace(stderr))
-                        logger.LogWarning("VoiceTimer: FFmpeg stderr for {FilePath}: {Stderr}", filePath, stderr);
-                    logger.LogInformation("VoiceTimer: FFmpeg exit code {ExitCode} for {FilePath}", ffmpeg.ExitCode, filePath);
+                        logger.LogWarning("VoiceTimer: FFmpeg stderr for {FilePath}: {Stderr} (guild={GuildId})", filePath, stderr, guildId);
+                    logger.LogInformation("VoiceTimer: FFmpeg exit code {ExitCode} for {FilePath} (guild={GuildId})", ffmpeg.ExitCode, filePath, guildId);
                 }
             }
         }

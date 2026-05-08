@@ -11,7 +11,14 @@
       "Bash(Select-Object FullName)",
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Irtesam\\\\Desktop\\\\Repos\\\\AyaseChihayaJungleBot\" -Recurse -Directory)",
       "Bash(Select-Object -ExpandProperty Name)",
-      "PowerShell(head *)"
+      "PowerShell(head *)",
+      "Bash(command -v ildasm)",
+      "Bash(command -v dotnet)",
+      "Bash(dotnet --list-sdks)",
+      "Bash(unzip -p /c/Users/Irtesam/.nuget/packages/netcord/1.0.0-alpha.468/lib/net10.0/NetCord.xml)",
+      "Bash(command -v ffmpeg)",
+      "Bash(command -v ffprobe)",
+      "Bash(ffmpeg -version)"
     ]
   }
 }
