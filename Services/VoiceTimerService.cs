@@ -16,6 +16,10 @@ public class VoiceTimerService(
     // 20 ms of silence at 48 kHz stereo 16-bit PCM (48000 * 2 channels * 2 bytes * 0.02 s).
     private static readonly byte[] SilencePcmFrame = new byte[3840];
 
+    // Serialize all JoinVoiceChannelAsync calls across guilds to avoid flooding the gateway
+    // with simultaneous VoiceStateUpdate handshakes when multiple guilds start at the same time.
+    private readonly SemaphoreSlim _voiceJoinGate = new(1, 1);
+
     private static readonly TimeSpan TotalDuration = TimeSpan.FromMinutes(25);
     private static readonly TimeSpan SpawnInterval = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan FirstSpawnElapsed = TimeSpan.FromMinutes(5);
@@ -51,11 +55,19 @@ public class VoiceTimerService(
             logger.LogInformation("VoiceTimer: [1] Sending voice join to gateway (guild={GuildId}, channel={ChannelId})",
                 state.Settings.GuildId, state.Settings.ChannelId);
 
-            state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
-                state.Settings.GuildId,
-                state.Settings.ChannelId,
-                new VoiceClientConfiguration(),
-                cancellationToken);
+            await _voiceJoinGate.WaitAsync(cancellationToken);
+            try
+            {
+                state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
+                    state.Settings.GuildId,
+                    state.Settings.ChannelId,
+                    new VoiceClientConfiguration(),
+                    cancellationToken);
+            }
+            finally
+            {
+                _voiceJoinGate.Release();
+            }
 
             logger.LogInformation("VoiceTimer: [2] JoinVoiceChannelAsync returned — calling StartAsync");
 
@@ -267,6 +279,9 @@ public class VoiceTimerService(
     private ValueTask OnVoiceClientClosedAsync(GuildTimerState state)
     {
         if (state.Cts is null || state.Cts.IsCancellationRequested) return ValueTask.CompletedTask;
+        // Prevent multiple concurrent reconnect tasks from stacking when the connection
+        // closes and re-closes rapidly before the first reconnect finishes.
+        if (Interlocked.CompareExchange(ref state.IsReconnecting, 1, 0) != 0) return ValueTask.CompletedTask;
         logger.LogWarning("VoiceTimer: Voice connection closed unexpectedly (guild={GuildId}) — scheduling reconnect", state.Settings.GuildId);
         _ = Task.Run(() => ReconnectVoiceAsync(state));
         return ValueTask.CompletedTask;
@@ -299,8 +314,16 @@ public class VoiceTimerService(
 
             await Task.Delay(TimeSpan.FromSeconds(3), token);
 
-            state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
-                state.Settings.GuildId, state.Settings.ChannelId, new VoiceClientConfiguration(), token);
+            await _voiceJoinGate.WaitAsync(token);
+            try
+            {
+                state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
+                    state.Settings.GuildId, state.Settings.ChannelId, new VoiceClientConfiguration(), token);
+            }
+            finally
+            {
+                _voiceJoinGate.Release();
+            }
 
             var readyTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             state.VoiceClient.Ready += () =>
@@ -337,15 +360,15 @@ public class VoiceTimerService(
         }
         finally
         {
+            Volatile.Write(ref state.IsReconnecting, 0);
             state.Lock.Release();
         }
     }
 
-    private async Task SendSilenceFramesAsync(GuildTimerState state, int count, CancellationToken ct)
+    private static async Task SendSilenceFramesAsync(Stream voiceStream, int count, CancellationToken ct)
     {
-        if (state.VoiceStream is null) return;
         await using var enc = new OpusEncodeStream(
-            state.VoiceStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio,
+            voiceStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio,
             new OpusEncodeStreamConfiguration { FrameDuration = 20.0f }, leaveOpen: true);
         for (var i = 0; i < count; i++)
             await enc.WriteAsync(SilencePcmFrame, ct);
@@ -353,7 +376,12 @@ public class VoiceTimerService(
 
     private async Task PlayClipAsync(GuildTimerState state, string filePath, CancellationToken ct)
     {
-        if (state.VoiceStream is null)
+        // Snapshot both references before any await so a concurrent ReconnectVoiceAsync cannot
+        // dispose+replace them between our null-check and our first write to the stream.
+        var voiceStream = state.VoiceStream;
+        var voiceClient = state.VoiceClient;
+
+        if (voiceStream is null)
         {
             logger.LogWarning("VoiceTimer: Skipping clip — voice stream is null (guild={GuildId})", state.Settings.GuildId);
             return;
@@ -365,10 +393,10 @@ public class VoiceTimerService(
             return;
         }
 
-        if (state.VoiceClient is not null)
-            await state.VoiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: ct);
+        if (voiceClient is not null)
+            await voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: ct);
 
-        await SendSilenceFramesAsync(state, 5, ct);
+        await SendSilenceFramesAsync(voiceStream, 5, ct);
 
         Process ffmpeg;
         try
@@ -403,7 +431,7 @@ public class VoiceTimerService(
                 try
                 {
                     await using var encodeStream = new OpusEncodeStream(
-                        state.VoiceStream,
+                        voiceStream,
                         PcmFormat.Short,
                         VoiceChannels.Stereo,
                         OpusApplication.Audio,
@@ -425,7 +453,7 @@ public class VoiceTimerService(
                 }
                 finally
                 {
-                    try { await ffmpeg.WaitForExitAsync(CancellationToken.None); } catch { /* ignore */ }
+                    try { await ffmpeg.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)); } catch { /* ignore */ }
                     var stderr = await stderrTask;
                     if (!string.IsNullOrWhiteSpace(stderr))
                         logger.LogWarning("VoiceTimer: FFmpeg stderr for {FilePath}: {Stderr}", filePath, stderr);
@@ -448,6 +476,7 @@ public class VoiceTimerService(
             finally { state.Lock.Release(); }
             state.Lock.Dispose();
         }
+        _voiceJoinGate.Dispose();
     }
 
     private sealed class GuildTimerState(VoiceTimerGuildSettings settings)
@@ -459,6 +488,7 @@ public class VoiceTimerService(
         public CancellationTokenSource? Cts;
         public Task? TimerTask;
         public Func<ValueTask>? VoiceCloseHandler;
+        public int IsReconnecting;  // 0 = idle, 1 = reconnect task in flight; use Interlocked
 
         public bool IsRunning => TimerTask is { IsCompleted: false };
     }

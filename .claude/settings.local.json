@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build:*)",
+      "Bash(xargs grep:*)",
+      "Bash(powershell -Command ':*)",
+      "Bash(mkdir -p \"C:/Users/Irtesam/AppData/Local/Temp/probe\")",
+      "Read(//c/Users/Irtesam/AppData/Local/Temp/probe/**)",
+      "Bash(dotnet run:*)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Irtesam\\\\Desktop\\\\Repos\\\\AyaseChihayaJungleBot\" -Recurse -File)",
+      "Bash(Select-Object FullName)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Irtesam\\\\Desktop\\\\Repos\\\\AyaseChihayaJungleBot\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty Name)",
+      "PowerShell(head *)"
+    ]
+  }
+}

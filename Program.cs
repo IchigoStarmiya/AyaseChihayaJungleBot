@@ -4,7 +4,6 @@ using Microsoft.Extensions.Logging;
 using NetCord.Gateway;
 using NetCord.Hosting.Gateway;
 using NetCord.Hosting.Services;
-using NetCord.Hosting.Services.ApplicationCommands;
 using VoiceTimerBot.BackgroundServices;
 using VoiceTimerBot.Interfaces;
 using VoiceTimerBot.Services;
@@ -32,11 +31,8 @@ builder.Services
         {
             options.Intents = GatewayIntents.GuildVoiceStates | GatewayIntents.GuildMessages | GatewayIntents.MessageContent;
         })
-       .AddApplicationCommands()
        .AddGatewayHandlers(typeof(Program).Assembly);
 
 var host = builder.Build();
-
-host.AddModules(typeof(Program).Assembly);
 
 await host.RunAsync();
