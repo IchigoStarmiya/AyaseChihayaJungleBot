@@ -210,7 +210,7 @@ public class VoiceTimerService(
         var guildId = state.Settings.GuildId;
         try
         {
-            await PlayClipAsync(state, state.Settings.StartClipPath, ct);
+            await PlayClipResilientAsync(state, state.Settings.StartClipPath, TimeSpan.FromSeconds(30), ct);
 
             // Monotonic clock — immune to wall-clock adjustments (NTP, DST, VM time skew)
             // that DateTimeOffset.UtcNow would expose us to over a 25-minute window.
@@ -222,12 +222,13 @@ public class VoiceTimerService(
                 var warn40Target = spawnElapsed - Warn40s;
                 await WaitUntilAsync(clock, warn40Target, ct);
                 LogDrift("warn40", clock, warn40Target, guildId);
-                await PlayClipAsync(state, state.Settings.Warn40s, ct);
+                // Cap retry budget so a slow reconnect can't push warn40 past the warn20 slot 20s later.
+                await PlayClipResilientAsync(state, state.Settings.Warn40s, TimeSpan.FromSeconds(10), ct);
 
                 var warn20Target = spawnElapsed - Warn20s;
                 await WaitUntilAsync(clock, warn20Target, ct);
                 LogDrift("warn20", clock, warn20Target, guildId);
-                await PlayClipAsync(state, state.Settings.Warn20s, ct);
+                await PlayClipResilientAsync(state, state.Settings.Warn20s, TimeSpan.FromSeconds(10), ct);
 
                 spawnElapsed += SpawnInterval;
             }
@@ -304,15 +305,62 @@ public class VoiceTimerService(
 
     private async Task ReconnectVoiceAsync(GuildTimerState state)
     {
-        if (state.Cts is null || state.Cts.IsCancellationRequested) return;
+        const int maxAttempts = 5;
+        var backoff = TimeSpan.FromSeconds(2);
 
+        try
+        {
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                if (state.Cts is null || state.Cts.IsCancellationRequested) return;
+
+                try
+                {
+                    await TryReconnectOnceAsync(state, attempt, maxAttempts);
+                    return; // success
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex,
+                        "VoiceTimer: Reconnect attempt {Attempt}/{Max} failed (guild={GuildId})",
+                        attempt, maxAttempts, state.Settings.GuildId);
+                }
+
+                if (attempt < maxAttempts)
+                {
+                    var ctsToken = state.Cts?.Token ?? CancellationToken.None;
+                    try { await Task.Delay(backoff, ctsToken); }
+                    catch (OperationCanceledException) { return; }
+                    backoff = TimeSpan.FromSeconds(Math.Min(30, backoff.TotalSeconds * 2));
+                }
+            }
+
+            logger.LogError("VoiceTimer: All {Max} reconnect attempts failed — voice will stay disconnected (guild={GuildId})",
+                maxAttempts, state.Settings.GuildId);
+        }
+        finally
+        {
+            // Cleared only after the entire retry sequence ends so OnVoiceClientClosedAsync
+            // doesn't spawn a parallel reconnect mid-retry.
+            Volatile.Write(ref state.IsReconnecting, 0);
+        }
+    }
+
+    private async Task TryReconnectOnceAsync(GuildTimerState state, int attempt, int max)
+    {
         await state.Lock.WaitAsync();
         try
         {
-            if (state.Cts is null || state.Cts.IsCancellationRequested) return;
+            if (state.Cts is null || state.Cts.IsCancellationRequested)
+                throw new OperationCanceledException();
             var token = state.Cts.Token;
 
-            logger.LogInformation("VoiceTimer: Re-establishing voice connection after disconnect (guild={GuildId})", state.Settings.GuildId);
+            logger.LogInformation("VoiceTimer: Reconnect attempt {Attempt}/{Max} (guild={GuildId})",
+                attempt, max, state.Settings.GuildId);
 
             if (state.VoiceStream is not null)
             {
@@ -363,24 +411,79 @@ public class VoiceTimerService(
             state.VoiceCloseHandler = () => OnVoiceClientClosedAsync(state);
             state.VoiceClient.Close += state.VoiceCloseHandler;
 
-            logger.LogInformation("VoiceTimer: Voice reconnected successfully (guild={GuildId})", state.Settings.GuildId);
+            logger.LogInformation("VoiceTimer: Voice reconnected successfully on attempt {Attempt}/{Max} (guild={GuildId})",
+                attempt, max, state.Settings.GuildId);
         }
-        catch (OperationCanceledException)
+        catch
         {
-            // Timer was stopped during reconnect.
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "VoiceTimer: Failed to reconnect voice (guild={GuildId})", state.Settings.GuildId);
+            // Tear down any partial voice state from this failed attempt so the next attempt
+            // (and the resilient clip player) sees a clean null-state instead of a half-connected client.
+            if (state.VoiceStream is not null)
+            {
+                try { await state.VoiceStream.DisposeAsync(); } catch { /* ignore */ }
+                state.VoiceStream = null;
+            }
+            if (state.VoiceClient is not null)
+            {
+                try { state.VoiceClient.Dispose(); } catch { /* ignore */ }
+                state.VoiceClient = null;
+            }
+            throw;
         }
         finally
         {
-            Volatile.Write(ref state.IsReconnecting, 0);
             state.Lock.Release();
         }
     }
 
-    private async Task PlayClipAsync(GuildTimerState state, string filePath, CancellationToken ct)
+    private async Task PlayClipResilientAsync(GuildTimerState state, string filePath, TimeSpan reconnectWait, CancellationToken ct)
+    {
+        const int maxAttempts = 3;
+        var guildId = state.Settings.GuildId;
+
+        // File-existence is checked once up front: a missing file is non-retriable, no reason to spin.
+        if (!File.Exists(filePath))
+        {
+            logger.LogWarning("VoiceTimer: Audio file not found, skipping: {FilePath} (guild={GuildId})", filePath, guildId);
+            return;
+        }
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            if (ct.IsCancellationRequested) return;
+
+            var played = await PlayClipAsync(state, filePath, ct);
+            if (played) return;
+
+            if (attempt < maxAttempts)
+            {
+                logger.LogWarning(
+                    "VoiceTimer: Clip {FilePath} did not complete (attempt {Attempt}/{Max}) — waiting up to {Wait}s for voice (guild={GuildId})",
+                    filePath, attempt, maxAttempts, (int)reconnectWait.TotalSeconds, guildId);
+                await WaitForVoiceReadyAsync(state, reconnectWait, ct);
+            }
+        }
+
+        logger.LogError("VoiceTimer: Clip {FilePath} did not play after {Max} attempts (guild={GuildId})",
+            filePath, maxAttempts, guildId);
+    }
+
+    private static async Task WaitForVoiceReadyAsync(GuildTimerState state, TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (ct.IsCancellationRequested) return;
+            if (state.VoiceStream is not null
+                && state.VoiceClient is not null
+                && Volatile.Read(ref state.IsReconnecting) == 0)
+                return;
+            try { await Task.Delay(TimeSpan.FromMilliseconds(500), ct); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private async Task<bool> PlayClipAsync(GuildTimerState state, string filePath, CancellationToken ct)
     {
         var guildId = state.Settings.GuildId;
 
@@ -391,14 +494,8 @@ public class VoiceTimerService(
 
         if (voiceStream is null)
         {
-            logger.LogWarning("VoiceTimer: Skipping clip — voice stream is null (guild={GuildId})", guildId);
-            return;
-        }
-
-        if (!File.Exists(filePath))
-        {
-            logger.LogWarning("VoiceTimer: Audio file not found, skipping: {FilePath} (guild={GuildId})", filePath, guildId);
-            return;
+            logger.LogWarning("VoiceTimer: Skipping clip — voice stream is null for {FilePath} (guild={GuildId})", filePath, guildId);
+            return false;
         }
 
         if (voiceClient is not null)
@@ -420,9 +517,10 @@ public class VoiceTimerService(
         catch (Exception ex)
         {
             logger.LogError(ex, "VoiceTimer: Failed to start FFmpeg for {FilePath} (guild={GuildId})", filePath, guildId);
-            return;
+            return false;
         }
 
+        var streamedOk = false;
         try
         {
             await using (ct.Register(() =>
@@ -458,6 +556,7 @@ public class VoiceTimerService(
                     logger.LogInformation(
                         "VoiceTimer: Finished streaming {FilePath} ({Bytes} PCM bytes) (guild={GuildId})",
                         filePath, countingStream.BytesRead, guildId);
+                    streamedOk = true;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -481,6 +580,8 @@ public class VoiceTimerService(
         {
             ffmpeg.Dispose();
         }
+
+        return streamedOk;
     }
 
     public async ValueTask DisposeAsync()
