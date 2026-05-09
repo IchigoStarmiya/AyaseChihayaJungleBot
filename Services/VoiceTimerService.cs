@@ -220,13 +220,13 @@ public class VoiceTimerService(
             while (spawnElapsed <= TotalDuration)
             {
                 var warn40Target = spawnElapsed - Warn40s;
-                await WaitUntilAsync(clock, warn40Target, ct);
+                await SendSilenceUntilAsync(state, clock, warn40Target, ct);
                 LogDrift("warn40", clock, warn40Target, guildId);
                 // Cap retry budget so a slow reconnect can't push warn40 past the warn20 slot 20s later.
                 await PlayClipResilientAsync(state, state.Settings.Warn40s, TimeSpan.FromSeconds(10), ct);
 
                 var warn20Target = spawnElapsed - Warn20s;
-                await WaitUntilAsync(clock, warn20Target, ct);
+                await SendSilenceUntilAsync(state, clock, warn20Target, ct);
                 LogDrift("warn20", clock, warn20Target, guildId);
                 await PlayClipResilientAsync(state, state.Settings.Warn20s, TimeSpan.FromSeconds(10), ct);
 
@@ -249,11 +249,54 @@ public class VoiceTimerService(
         }
     }
 
-    private static async Task WaitUntilAsync(Stopwatch clock, TimeSpan target, CancellationToken ct)
+    // Replaces a passive Task.Delay between clips. NetCord's NormalizeSpeed paces these writes in real
+    // time, producing one Opus packet every 20 ms — the cadence Discord expects. Long idle gaps over UDP
+    // let intermediaries (NAT, host conntrack, the voice gateway itself) consider the path dead and
+    // tear it down, which manifests as the bot suddenly being silent or disconnected mid-session.
+    // Streaming silence also surfaces a broken connection within a couple of seconds (a write throws),
+    // letting the reconnect retry start immediately instead of waiting for the next scheduled clip.
+    private async Task SendSilenceUntilAsync(GuildTimerState state, Stopwatch clock, TimeSpan target, CancellationToken ct)
     {
-        var remaining = target - clock.Elapsed;
-        if (remaining > TimeSpan.Zero)
-            await Task.Delay(remaining, ct);
+        var guildId = state.Settings.GuildId;
+
+        while (clock.Elapsed < target)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var voiceStream = state.VoiceStream;
+            if (voiceStream is null)
+            {
+                // Voice is down — wait briefly for reconnect to publish a fresh stream, then retry.
+                await WaitForVoiceReadyAsync(state, TimeSpan.FromSeconds(5), ct);
+                continue;
+            }
+
+            try
+            {
+                await using var encodeStream = new OpusEncodeStream(
+                    voiceStream,
+                    PcmFormat.Short,
+                    VoiceChannels.Stereo,
+                    OpusApplication.Audio,
+                    new OpusEncodeStreamConfiguration { FrameDuration = 20.0f },
+                    leaveOpen: true);
+
+                while (clock.Elapsed < target)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await encodeStream.WriteAsync(SilencePcmFrame, ct);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "VoiceTimer: Silence keepalive interrupted, waiting for voice (guild={GuildId})", guildId);
+                await WaitForVoiceReadyAsync(state, TimeSpan.FromSeconds(10), ct);
+            }
+        }
     }
 
     private void LogDrift(string label, Stopwatch clock, TimeSpan target, ulong guildId)
