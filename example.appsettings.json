@@ -7,28 +7,20 @@
     "FfmpegPath": "ffmpeg",
     "Servers": [
       {
-        "GuildId": 897508084619034704,
-        "ChannelId": 1462166549053047066,
-        "AuthorizedRoleId": 1468711942461063200,
-        "StartClipPath": "Audio/junglebot.mp3",
-        "Warn40s": "Audio/respawn40.mp3",
-        "Warn20s": "Audio/respawn20.mp3"
-      },
-      {
         "GuildId": 1429191473181491304,
         "ChannelId": 1481362925770772713,
         "AuthorizedRoleId": 1444419209772666962,
-        "StartClipPath": "Audio/junglebot.mp3",
-        "Warn40s": "Audio/respawn40.mp3",
-        "Warn20s": "Audio/respawn20.mp3"
+        "StartClipPath": "Audio/obsonline.opus",
+        "Warn40s": "Audio/obs40.opus",
+        "Warn20s": "Audio/obs20.opus"
       },
       {
         "GuildId": 386933744025468939,
         "ChannelId": 386933744025468943,
         "AuthorizedRoleId": 401363878820446208,
-        "StartClipPath": "Audio/junglebot.mp3",
-        "Warn40s": "Audio/respawn40.mp3",
-        "Warn20s": "Audio/respawn20.mp3"
+        "StartClipPath": "Audio/junglebot.opus",
+        "Warn40s": "Audio/respawn40.opus",
+        "Warn20s": "Audio/respawn20.opus"
       }
     ]
   }

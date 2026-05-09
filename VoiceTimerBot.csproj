@@ -31,4 +31,48 @@
         </None>
     </ItemGroup>
 
+    <UsingTask TaskName="VerifyVoiceClips"
+               TaskFactory="RoslynCodeTaskFactory"
+               AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+        <ParameterGroup>
+            <AppSettingsPath ParameterType="System.String" Required="true" />
+            <BaseDir ParameterType="System.String" Required="true" />
+            <Missing ParameterType="System.String" Output="true" />
+        </ParameterGroup>
+        <Task>
+            <Using Namespace="System" />
+            <Using Namespace="System.Collections.Generic" />
+            <Using Namespace="System.IO" />
+            <Using Namespace="System.Text.RegularExpressions" />
+            <Code Type="Fragment" Language="cs">
+                <![CDATA[
+                    var keys = new[] { "StartClipPath", "Warn40s", "Warn20s", "MaiJungle" };
+                    var pattern = "\"(" + string.Join("|", keys) + ")\"\\s*:\\s*\"([^\"]+)\"";
+                    var json = File.ReadAllText(AppSettingsPath);
+                    var missing = new List<string>();
+                    foreach (Match m in Regex.Matches(json, pattern))
+                    {
+                        var key = m.Groups[1].Value;
+                        var rel = m.Groups[2].Value;
+                        var resolved = Path.IsPathRooted(rel) ? rel : Path.Combine(BaseDir, rel);
+                        if (!File.Exists(resolved))
+                            missing.Add(key + "=\"" + rel + "\"");
+                    }
+                    Missing = string.Join("; ", missing);
+                ]]>
+            </Code>
+        </Task>
+    </UsingTask>
+
+    <Target Name="VerifyVoiceClipsExist"
+            BeforeTargets="Build"
+            Condition="Exists('$(MSBuildProjectDirectory)\appsettings.json')">
+        <VerifyVoiceClips AppSettingsPath="$(MSBuildProjectDirectory)\appsettings.json"
+                          BaseDir="$(MSBuildProjectDirectory)">
+            <Output TaskParameter="Missing" PropertyName="_MissingVoiceClips" />
+        </VerifyVoiceClips>
+        <Error Condition="'$(_MissingVoiceClips)' != ''"
+               Text="Voice clip(s) referenced in appsettings.json do not exist on disk: $(_MissingVoiceClips)" />
+    </Target>
+
 </Project>
