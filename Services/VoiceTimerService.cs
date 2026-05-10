@@ -547,7 +547,8 @@ public class VoiceTimerService(
         Process ffmpeg;
         try
         {
-            var loudnormArg = guildId == 1315399824010514563UL ? "" : "-af loudnorm=I=-5 ";
+            var skipLoudnorm = guildId is 1315399824010514563UL or 1501672515058012250UL;
+            var loudnormArg = skipLoudnorm ? "" : "-af loudnorm=I=-5 ";
             ffmpeg = Process.Start(new ProcessStartInfo
             {
                 FileName = _settings.FfmpegPath,
