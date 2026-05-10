@@ -547,10 +547,11 @@ public class VoiceTimerService(
         Process ffmpeg;
         try
         {
+            var loudnormArg = guildId == 1315399824010514563UL ? "" : "-af loudnorm=I=-5 ";
             ffmpeg = Process.Start(new ProcessStartInfo
             {
                 FileName = _settings.FfmpegPath,
-                Arguments = $"-hide_banner -loglevel error -i \"{filePath}\" -af loudnorm=I=-5 -ac 2 -ar 48000 -f s16le pipe:1",
+                Arguments = $"-hide_banner -loglevel error -i \"{filePath}\" {loudnormArg}-ac 2 -ar 48000 -f s16le pipe:1",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
