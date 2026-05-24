@@ -23,8 +23,12 @@ public class VoiceTimerService(
     private static readonly TimeSpan TotalDuration = TimeSpan.FromMinutes(25);
     private static readonly TimeSpan SpawnInterval = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan FirstSpawnElapsed = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan Warn60s = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan Warn40s = TimeSpan.FromSeconds(40);
     private static readonly TimeSpan Warn20s = TimeSpan.FromSeconds(20);
+
+    // Only this guild gets the extra 60-second spawn warning.
+    private const ulong Warn60GuildId = 1434117124833411215UL;
 
     private readonly VoiceTimerSettings _settings = options.Value;
     private readonly Dictionary<ulong, GuildTimerState> _guilds =
@@ -219,6 +223,14 @@ public class VoiceTimerService(
 
             while (spawnElapsed <= TotalDuration)
             {
+                if (guildId == Warn60GuildId)
+                {
+                    var warn60Target = spawnElapsed - Warn60s;
+                    await SendSilenceUntilAsync(state, clock, warn60Target, ct);
+                    LogDrift("warn60", clock, warn60Target, guildId);
+                    await PlayClipResilientAsync(state, state.Settings.Warn60s, TimeSpan.FromSeconds(10), ct);
+                }
+
                 var warn40Target = spawnElapsed - Warn40s;
                 await SendSilenceUntilAsync(state, clock, warn40Target, ct);
                 LogDrift("warn40", clock, warn40Target, guildId);
