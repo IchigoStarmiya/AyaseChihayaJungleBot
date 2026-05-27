@@ -18,7 +18,21 @@
       "Bash(unzip -p /c/Users/Irtesam/.nuget/packages/netcord/1.0.0-alpha.468/lib/net10.0/NetCord.xml)",
       "Bash(command -v ffmpeg)",
       "Bash(command -v ffprobe)",
-      "Bash(ffmpeg -version)"
+      "Bash(ffmpeg -version)",
+      "Bash(git *)",
+      "PowerShell(dotnet build *)",
+      "PowerShell(ffmpeg *)",
+      "Bash(grep -iE \"^Leave|GuildAsync$\")",
+      "Bash(command -v strings)",
+      "PowerShell($asm = [System.Reflection.Assembly]::LoadFrom\\(\"C:\\\\Users\\\\Irtesam\\\\.nuget\\\\packages\\\\netcord\\\\1.0.0-alpha.468\\\\lib\\\\net10.0\\\\NetCord.dll\"\\); $t = $asm.GetType\\(\"NetCord.Rest.RestClient\"\\); $t.GetMethods\\(\\) | Where-Object { $_.Name -match \"Leave|Guild\" -and $_.Name -match \"Leave\" } | Select-Object -ExpandProperty Name -Unique)",
+      "PowerShell($asm = [System.Reflection.Assembly]::LoadFrom\\(\"C:\\\\Users\\\\Irtesam\\\\.nuget\\\\packages\\\\netcord\\\\1.0.0-alpha.468\\\\lib\\\\net10.0\\\\NetCord.dll\"\\); $types = $asm.GetTypes\\(\\); $types | Where-Object { $_.Name -eq \"RestClient\" } | ForEach-Object { $_.FullName }; \"---methods---\"; $types | ForEach-Object { $_.GetMethods\\(\\) } | Where-Object { $_.Name -match \"Leave\" } | Select-Object -ExpandProperty Name -Unique)",
+      "PowerShell($asm = [System.Reflection.Assembly]::LoadFrom\\(\"C:\\\\Users\\\\Irtesam\\\\.nuget\\\\packages\\\\netcord\\\\1.0.0-alpha.468\\\\lib\\\\net10.0\\\\NetCord.dll\"\\); try { $types = $asm.GetTypes\\(\\) } catch [System.Reflection.ReflectionTypeLoadException] { $types = $_.Exception.Types | Where-Object { $_ -ne $null } }; $rc = $types | Where-Object { $_.Name -eq \"RestClient\" }; \"RestClient found: $\\($rc -ne $null\\)\"; $rc.GetMethods\\(\\) | Where-Object { $_.Name -match \"Leave|DeleteGuild\" } | ForEach-Object { $_.Name + \"\\(\" + \\(\\($_.GetParameters\\(\\) | ForEach-Object { $_.ParameterType.Name + ' ' + $_.Name }\\) -join ', '\\) + \"\\)\" } | Sort-Object -Unique)",
+      "WebFetch(domain:netcord.dev)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(cd /tmp)",
+      "Bash(gh api *)"
     ]
   }
 }

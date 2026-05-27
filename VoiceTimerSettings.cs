@@ -3,6 +3,7 @@ namespace VoiceTimerBot.Services;
 public class VoiceTimerSettings
 {
     public string FfmpegPath { get; set; } = "ffmpeg";
+    public ulong OwnerId { get; set; }
     public List<VoiceTimerGuildSettings> Servers { get; set; } = [];
 }
 

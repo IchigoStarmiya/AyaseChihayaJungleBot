@@ -34,6 +34,35 @@ public class MessageCreateHandler(
             case "stoptimer":
                 await HandleStopTimerAsync(message);
                 break;
+            case "leaveserver":
+                await HandleLeaveServerAsync(message, commandText, spaceIndex);
+                break;
+        }
+    }
+
+    private async Task HandleLeaveServerAsync(Message message, string commandText, int spaceIndex)
+    {
+        if (message.Author.Id != options.Value.OwnerId)
+        {
+            await SendAsync(message.ChannelId, "You do not have permission to use this command.");
+            return;
+        }
+
+        var argument = spaceIndex >= 0 ? commandText[(spaceIndex + 1)..].Trim() : string.Empty;
+        if (!ulong.TryParse(argument, out var targetGuildId))
+        {
+            await SendAsync(message.ChannelId, "Usage: ;leaveserver <guildId>");
+            return;
+        }
+
+        try
+        {
+            await restClient.LeaveGuildAsync(targetGuildId);
+            await SendAsync(message.ChannelId, $"Left guild {targetGuildId}.");
+        }
+        catch (Exception ex)
+        {
+            await SendAsync(message.ChannelId, $"Failed to leave guild {targetGuildId}: {ex.GetType().Name}: {ex.Message}");
         }
     }
 

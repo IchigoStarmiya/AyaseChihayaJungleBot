@@ -5,6 +5,7 @@
   "Dsn": "",
   "VoiceTimer": {
     "FfmpegPath": "ffmpeg",
+    "OwnerId": 123456789012345678,
     "Servers": [
       {
         "GuildId": 1429191473181491304,
