@@ -16,9 +16,31 @@ public class VoiceTimerService(
     // 20 ms of silence at 48 kHz stereo 16-bit PCM (48000 * 2 channels * 2 bytes * 0.02 s).
     private static readonly byte[] SilencePcmFrame = new byte[3840];
 
+    // This guild gets absolute priority for contended resources: it jumps to the front of the
+    // voice-join queue and bypasses the FFmpeg decode concurrency cap, so a synchronized start by
+    // many other guilds can never delay its join or its clip playback.
+    private const ulong PriorityGuildId = 1315399824010514563UL;
+
     // Serialize all JoinVoiceChannelAsync calls across guilds to avoid flooding the gateway
     // with simultaneous VoiceStateUpdate handshakes when multiple guilds start at the same time.
-    private readonly SemaphoreSlim _voiceJoinGate = new(1, 1);
+    // A PriorityGate (not a plain SemaphoreSlim) so PriorityGuildId is served before any normal
+    // guild already waiting in line.
+    private readonly PriorityGate _voiceJoinGate = new(1);
+
+    // #1: Cap concurrent FFmpeg decode processes across all guilds. Without this, a synchronized
+    // cold start (many guilds hitting the same spawn warning at once) could spawn one FFmpeg per
+    // guild simultaneously — each ~20-40 MB RSS — which OOMs a small VPS long before CPU saturates.
+    // Only cache misses pass through here, so in steady state this is rarely contended.
+    private const int MaxConcurrentFfmpeg = 4;
+    private readonly SemaphoreSlim _ffmpegGate = new(MaxConcurrentFfmpeg, MaxConcurrentFfmpeg);
+
+    // #2: Decoded-PCM cache. Each distinct (file, loudnorm) variant is decoded by FFmpeg exactly
+    // once into 48 kHz/stereo/s16le PCM; every subsequent play streams the cached bytes directly,
+    // with no per-play FFmpeg process. This removes the decode CPU spike and the process-RAM storm
+    // when many guilds fire a warning at the same instant — loudnorm runs once per file, not per play.
+    private readonly Dictionary<(string Path, bool SkipLoudnorm), byte[]> _pcmCache = new();
+    private readonly Dictionary<(string Path, bool SkipLoudnorm), SemaphoreSlim> _pcmDecodeLocks = new();
+    private readonly object _pcmCacheGuard = new();
 
     private static readonly TimeSpan TotalDuration = TimeSpan.FromMinutes(25);
     private static readonly TimeSpan SpawnInterval = TimeSpan.FromMinutes(5);
@@ -59,7 +81,7 @@ public class VoiceTimerService(
             logger.LogInformation("VoiceTimer: [1] Sending voice join to gateway (guild={GuildId}, channel={ChannelId})",
                 state.Settings.GuildId, state.Settings.ChannelId);
 
-            await _voiceJoinGate.WaitAsync(cancellationToken);
+            await _voiceJoinGate.WaitAsync(guildId == PriorityGuildId, cancellationToken);
             try
             {
                 state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
@@ -432,7 +454,7 @@ public class VoiceTimerService(
 
             await Task.Delay(TimeSpan.FromSeconds(3), token);
 
-            await _voiceJoinGate.WaitAsync(token);
+            await _voiceJoinGate.WaitAsync(state.Settings.GuildId == PriorityGuildId, token);
             try
             {
                 state.VoiceClient = await gatewayClient.JoinVoiceChannelAsync(
@@ -553,92 +575,182 @@ public class VoiceTimerService(
             return false;
         }
 
-        if (voiceClient is not null)
-            await voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: ct);
-
-        Process ffmpeg;
-        try
+        // Decode-on-first-use, then serve from the in-memory cache. The expensive FFmpeg + loudnorm
+        // work happens at most once per (file, loudnorm) variant; every later play is a memory read.
+        var skipLoudnorm = guildId is 1315399824010514563UL or 1501672515058012250UL;
+        var pcm = await GetOrDecodePcmAsync(filePath, skipLoudnorm, guildId, ct);
+        if (pcm is null || pcm.Length == 0)
         {
-            var skipLoudnorm = guildId is 1315399824010514563UL or 1501672515058012250UL;
-            var loudnormArg = skipLoudnorm ? "" : "-af loudnorm=I=-5 ";
-            ffmpeg = Process.Start(new ProcessStartInfo
-            {
-                FileName = _settings.FfmpegPath,
-                Arguments = $"-hide_banner -loglevel error -i \"{filePath}\" {loudnormArg}-ac 2 -ar 48000 -f s16le pipe:1",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }) ?? throw new InvalidOperationException("Process.Start returned null.");
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "VoiceTimer: Failed to start FFmpeg for {FilePath} (guild={GuildId})", filePath, guildId);
+            logger.LogWarning("VoiceTimer: No decoded audio available for {FilePath} (guild={GuildId})", filePath, guildId);
             return false;
         }
 
-        var streamedOk = false;
+        if (voiceClient is not null)
+            await voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone), cancellationToken: ct);
+
         try
         {
-            await using (ct.Register(() =>
+            // One encoder per clip — covers both the silence prefix and the audio body.
+            // Avoids the previous design's two encoder lifecycles per clip, which churned
+            // Opus encoder state and added unnecessary CPU + GC pressure between guilds.
+            await using var encodeStream = new OpusEncodeStream(
+                voiceStream,
+                PcmFormat.Short,
+                VoiceChannels.Stereo,
+                OpusApplication.Audio,
+                new OpusEncodeStreamConfiguration { FrameDuration = 20.0f },
+                leaveOpen: true);
+
+            // Silence prefix gives Discord's jitter buffer a head start and prevents the
+            // previous transmission's Opus tail from interpolating into this clip.
+            for (var i = 0; i < 5; i++)
+                await encodeStream.WriteAsync(SilencePcmFrame, ct);
+
+            // MemoryStream + CopyToAsync mirrors the previous ffmpeg-stdout path exactly, so the
+            // encoder's framing and NormalizeSpeed's real-time pacing behave identically.
+            using var pcmStream = new MemoryStream(pcm, writable: false);
+            await pcmStream.CopyToAsync(encodeStream, ct);
+
+            logger.LogInformation(
+                "VoiceTimer: Finished streaming {FilePath} ({Bytes} PCM bytes) (guild={GuildId})",
+                filePath, pcm.Length, guildId);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "VoiceTimer: Error while streaming audio from {FilePath} (guild={GuildId})", filePath, guildId);
+            return false;
+        }
+    }
+
+    // Returns cached PCM for the variant, decoding it via FFmpeg on the first request. A per-key
+    // lock ensures a single decode even if many guilds request the same variant simultaneously on a
+    // cold start; the global _ffmpegGate caps how many *distinct* decodes run at once. Returns null
+    // if decoding fails (e.g. FFmpeg missing or a corrupt file), so the caller can retry/skip.
+    private async Task<byte[]?> GetOrDecodePcmAsync(string filePath, bool skipLoudnorm, ulong guildId, CancellationToken ct)
+    {
+        var key = (filePath, skipLoudnorm);
+
+        lock (_pcmCacheGuard)
+        {
+            if (_pcmCache.TryGetValue(key, out var hit))
+                return hit;
+        }
+
+        SemaphoreSlim keyLock;
+        lock (_pcmCacheGuard)
+        {
+            // Re-check under the lock in case another caller finished the decode while we waited.
+            if (_pcmCache.TryGetValue(key, out var hit))
+                return hit;
+            if (!_pcmDecodeLocks.TryGetValue(key, out keyLock!))
             {
-                try { ffmpeg.Kill(entireProcessTree: true); }
-                catch { /* process already exited */ }
-            }))
+                keyLock = new SemaphoreSlim(1, 1);
+                _pcmDecodeLocks[key] = keyLock;
+            }
+        }
+
+        await keyLock.WaitAsync(ct);
+        try
+        {
+            lock (_pcmCacheGuard)
             {
+                if (_pcmCache.TryGetValue(key, out var hit))
+                    return hit;
+            }
+
+            var pcm = await DecodeToPcmAsync(filePath, skipLoudnorm, guildId, ct);
+            if (pcm is not null)
+            {
+                lock (_pcmCacheGuard)
+                {
+                    _pcmCache[key] = pcm;
+                }
+            }
+            return pcm;
+        }
+        finally
+        {
+            keyLock.Release();
+        }
+    }
+
+    private async Task<byte[]?> DecodeToPcmAsync(string filePath, bool skipLoudnorm, ulong guildId, CancellationToken ct)
+    {
+        // The priority guild bypasses the concurrency cap entirely so it never waits behind other
+        // guilds' decodes. Its RunLoop plays clips sequentially, so this adds at most one extra
+        // concurrent FFmpeg process — negligible RAM against the headroom the cap protects.
+        var priority = guildId == PriorityGuildId;
+        if (!priority)
+            await _ffmpegGate.WaitAsync(ct);
+        try
+        {
+            Process ffmpeg;
+            try
+            {
+                var loudnormArg = skipLoudnorm ? "" : "-af loudnorm=I=-5 ";
+                ffmpeg = Process.Start(new ProcessStartInfo
+                {
+                    FileName = _settings.FfmpegPath,
+                    Arguments = $"-hide_banner -loglevel error -i \"{filePath}\" {loudnormArg}-ac 2 -ar 48000 -f s16le pipe:1",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }) ?? throw new InvalidOperationException("Process.Start returned null.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "VoiceTimer: Failed to start FFmpeg to decode {FilePath} (guild={GuildId})", filePath, guildId);
+                return null;
+            }
+
+            try
+            {
+                await using var cancelKill = ct.Register(() =>
+                {
+                    try { ffmpeg.Kill(entireProcessTree: true); }
+                    catch { /* process already exited */ }
+                });
+
                 // Drain stderr in the background to prevent FFmpeg blocking on a full pipe buffer.
                 var stderrTask = ffmpeg.StandardError.ReadToEndAsync(CancellationToken.None);
 
-                try
-                {
-                    // One encoder per clip — covers both the silence prefix and the audio body.
-                    // Avoids the previous design's two encoder lifecycles per clip, which churned
-                    // Opus encoder state and added unnecessary CPU + GC pressure between guilds.
-                    await using var encodeStream = new OpusEncodeStream(
-                        voiceStream,
-                        PcmFormat.Short,
-                        VoiceChannels.Stereo,
-                        OpusApplication.Audio,
-                        new OpusEncodeStreamConfiguration { FrameDuration = 20.0f },
-                        leaveOpen: true);
+                using var pcmBuffer = new MemoryStream();
+                await ffmpeg.StandardOutput.BaseStream.CopyToAsync(pcmBuffer, ct);
 
-                    // Silence prefix gives Discord's jitter buffer a head start and prevents the
-                    // previous transmission's Opus tail from interpolating into this clip.
-                    for (var i = 0; i < 5; i++)
-                        await encodeStream.WriteAsync(SilencePcmFrame, ct);
+                try { await ffmpeg.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10), ct); } catch { /* ignore */ }
 
-                    var countingStream = new ByteCountingStream(ffmpeg.StandardOutput.BaseStream);
-                    await countingStream.CopyToAsync(encodeStream, ct);
+                var stderr = await stderrTask;
+                if (!string.IsNullOrWhiteSpace(stderr))
+                    logger.LogWarning("VoiceTimer: FFmpeg stderr decoding {FilePath}: {Stderr} (guild={GuildId})", filePath, stderr, guildId);
 
-                    logger.LogInformation(
-                        "VoiceTimer: Finished streaming {FilePath} ({Bytes} PCM bytes) (guild={GuildId})",
-                        filePath, countingStream.BytesRead, guildId);
-                    streamedOk = true;
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                if (ffmpeg.HasExited && ffmpeg.ExitCode != 0)
                 {
-                    throw;
+                    logger.LogError("VoiceTimer: FFmpeg exit code {ExitCode} decoding {FilePath} (guild={GuildId})", ffmpeg.ExitCode, filePath, guildId);
+                    return null;
                 }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, "VoiceTimer: Error while streaming audio from {FilePath} (guild={GuildId})", filePath, guildId);
-                }
-                finally
-                {
-                    try { await ffmpeg.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)); } catch { /* ignore */ }
-                    var stderr = await stderrTask;
-                    if (!string.IsNullOrWhiteSpace(stderr))
-                        logger.LogWarning("VoiceTimer: FFmpeg stderr for {FilePath}: {Stderr} (guild={GuildId})", filePath, stderr, guildId);
-                    logger.LogInformation("VoiceTimer: FFmpeg exit code {ExitCode} for {FilePath} (guild={GuildId})", ffmpeg.ExitCode, filePath, guildId);
-                }
+
+                var pcm = pcmBuffer.ToArray();
+                logger.LogInformation(
+                    "VoiceTimer: Cached {Bytes} PCM bytes for {FilePath} (loudnorm={Loudnorm}, guild={GuildId})",
+                    pcm.Length, filePath, !skipLoudnorm, guildId);
+                return pcm;
+            }
+            finally
+            {
+                ffmpeg.Dispose();
             }
         }
         finally
         {
-            ffmpeg.Dispose();
+            if (!priority)
+                _ffmpegGate.Release();
         }
-
-        return streamedOk;
     }
 
     public async ValueTask DisposeAsync()
@@ -650,7 +762,14 @@ public class VoiceTimerService(
             finally { state.Lock.Release(); }
             state.Lock.Dispose();
         }
-        _voiceJoinGate.Dispose();
+        _ffmpegGate.Dispose();
+        lock (_pcmCacheGuard)
+        {
+            foreach (var decodeLock in _pcmDecodeLocks.Values)
+                decodeLock.Dispose();
+            _pcmDecodeLocks.Clear();
+            _pcmCache.Clear();
+        }
     }
 
     private sealed class GuildTimerState(VoiceTimerGuildSettings settings)
@@ -666,33 +785,85 @@ public class VoiceTimerService(
 
         public bool IsRunning => TimerTask is { IsCompleted: false };
     }
-}
 
-file sealed class ByteCountingStream(Stream inner) : Stream
-{
-    public long BytesRead { get; private set; }
-
-    public override bool CanRead => inner.CanRead;
-    public override bool CanSeek => false;
-    public override bool CanWrite => false;
-    public override long Length => throw new NotSupportedException();
-    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-    public override void Flush() { }
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-    public override int Read(byte[] buffer, int offset, int count)
+    // A capacity-limited async gate that serves waiters in priority order rather than FIFO:
+    // a high-priority waiter is admitted ahead of every normal waiter already in line (but behind
+    // earlier high-priority waiters). SemaphoreSlim offers no such ordering, so we maintain the
+    // wait list ourselves. Permits are non-reentrant; every WaitAsync must be paired with a Release.
+    private sealed class PriorityGate
     {
-        var n = inner.Read(buffer, offset, count);
-        BytesRead += n;
-        return n;
-    }
+        private readonly object _sync = new();
+        private int _available;
+        private readonly LinkedList<(TaskCompletionSource Tcs, bool High)> _waiters = new();
 
-    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-    {
-        var n = await inner.ReadAsync(buffer, cancellationToken);
-        BytesRead += n;
-        return n;
+        public PriorityGate(int capacity) => _available = capacity;
+
+        public Task WaitAsync(bool highPriority, CancellationToken ct)
+        {
+            if (ct.IsCancellationRequested)
+                return Task.FromCanceled(ct);
+
+            lock (_sync)
+            {
+                if (_available > 0)
+                {
+                    _available--;
+                    return Task.CompletedTask;
+                }
+
+                var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                LinkedListNode<(TaskCompletionSource Tcs, bool High)> node;
+                if (highPriority)
+                {
+                    // Insert ahead of the first normal waiter, preserving order among high-priority ones.
+                    var cursor = _waiters.First;
+                    while (cursor is not null && cursor.Value.High)
+                        cursor = cursor.Next;
+                    node = cursor is null ? _waiters.AddLast((tcs, true)) : _waiters.AddBefore(cursor, (tcs, true));
+                }
+                else
+                {
+                    node = _waiters.AddLast((tcs, false));
+                }
+
+                if (ct.CanBeCanceled)
+                {
+                    var registration = ct.Register(() =>
+                    {
+                        lock (_sync)
+                        {
+                            if (node.List is not null)
+                                _waiters.Remove(node);
+                        }
+                        tcs.TrySetCanceled(ct);
+                    });
+                    // Dispose the registration once the wait settles, regardless of outcome.
+                    tcs.Task.ContinueWith(
+                        static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
+                        registration, CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+
+                return tcs.Task;
+            }
+        }
+
+        public void Release()
+        {
+            lock (_sync)
+            {
+                while (_waiters.First is not null)
+                {
+                    var node = _waiters.First;
+                    _waiters.RemoveFirst();
+                    // RunContinuationsAsynchronously keeps the awaiter's continuation off this thread,
+                    // so we never run user code while holding _sync. A cancelled waiter fails TrySetResult
+                    // and we hand the permit to the next one instead.
+                    if (node.Value.Tcs.TrySetResult())
+                        return;
+                }
+                _available++;
+            }
+        }
     }
 }
