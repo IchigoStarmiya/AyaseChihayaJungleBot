@@ -48,6 +48,8 @@ public class VoiceTimerService(
     private static readonly TimeSpan Warn60s = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan Warn40s = TimeSpan.FromSeconds(40);
     private static readonly TimeSpan Warn20s = TimeSpan.FromSeconds(20);
+    
+    private static readonly TimeSpan ZealInterval = TimeSpan.FromMinutes(3);
 
     // Only this guild gets the extra 60-second spawn warning.
     private const ulong Warn60GuildId = 1434117124833411215UL;
@@ -241,30 +243,16 @@ public class VoiceTimerService(
             // Monotonic clock — immune to wall-clock adjustments (NTP, DST, VM time skew)
             // that DateTimeOffset.UtcNow would expose us to over a 25-minute window.
             var clock = Stopwatch.StartNew();
-            var spawnElapsed = FirstSpawnElapsed;
 
-            while (spawnElapsed <= TotalDuration)
+            // The jungle warnings and the zeal reminder share this guild's single voice stream, so
+            // we merge them into one time-ordered schedule and play each cue in turn. A guild with no
+            // zeal clip contributes no zeal cues, leaving only the jungle timer.
+            foreach (var (target, label, clipPath) in BuildSchedule(state.Settings))
             {
-                if (guildId == Warn60GuildId)
-                {
-                    var warn60Target = spawnElapsed - Warn60s;
-                    await SendSilenceUntilAsync(state, clock, warn60Target, ct);
-                    LogDrift("warn60", clock, warn60Target, guildId);
-                    await PlayClipResilientAsync(state, state.Settings.Warn60s, TimeSpan.FromSeconds(10), ct);
-                }
-
-                var warn40Target = spawnElapsed - Warn40s;
-                await SendSilenceUntilAsync(state, clock, warn40Target, ct);
-                LogDrift("warn40", clock, warn40Target, guildId);
-                // Cap retry budget so a slow reconnect can't push warn40 past the warn20 slot 20s later.
-                await PlayClipResilientAsync(state, state.Settings.Warn40s, TimeSpan.FromSeconds(10), ct);
-
-                var warn20Target = spawnElapsed - Warn20s;
-                await SendSilenceUntilAsync(state, clock, warn20Target, ct);
-                LogDrift("warn20", clock, warn20Target, guildId);
-                await PlayClipResilientAsync(state, state.Settings.Warn20s, TimeSpan.FromSeconds(10), ct);
-
-                spawnElapsed += SpawnInterval;
+                await SendSilenceUntilAsync(state, clock, target, ct);
+                LogDrift(label, clock, target, guildId);
+                // Cap retry budget so a slow reconnect can't push one cue past the next slot.
+                await PlayClipResilientAsync(state, clipPath, TimeSpan.FromSeconds(10), ct);
             }
 
             // Natural end after last jungle spawn — wait for Discord's jitter buffer to drain before disconnecting.
@@ -281,6 +269,36 @@ public class VoiceTimerService(
         {
             logger.LogError(ex, "VoiceTimer: Timer loop encountered an unhandled error (guild={GuildId})", guildId);
         }
+    }
+
+    // Builds the full, time-ordered list of cues to play for one session: the jungle spawn warnings
+    // (60s only for the opted-in guild, plus 40s and 20s) on the 5-minute spawn cycle, merged with the
+    // "upgrade zeal" GvG reminder on its 3-minute cadence. Targets are elapsed offsets from the start
+    // clip. When two cues land on the same instant the jungle warning wins the tie so the time-critical
+    // spawn cue is never delayed behind the zeal reminder.
+    private static List<(TimeSpan Target, string Label, string ClipPath)> BuildSchedule(VoiceTimerGuildSettings s)
+    {
+        var events = new List<(TimeSpan Target, int Tie, string Label, string ClipPath)>();
+
+        for (var spawnElapsed = FirstSpawnElapsed; spawnElapsed <= TotalDuration; spawnElapsed += SpawnInterval)
+        {
+            if (s.GuildId == Warn60GuildId)
+                events.Add((spawnElapsed - Warn60s, 0, "warn60", s.Warn60s));
+            events.Add((spawnElapsed - Warn40s, 0, "warn40", s.Warn40s));
+            events.Add((spawnElapsed - Warn20s, 0, "warn20", s.Warn20s));
+        }
+
+        if (!string.IsNullOrWhiteSpace(s.ZealClipPath))
+        {
+            for (var t = ZealInterval; t <= TotalDuration; t += ZealInterval)
+                events.Add((t, 1, "zeal", s.ZealClipPath));
+        }
+
+        return events
+            .OrderBy(e => e.Target)
+            .ThenBy(e => e.Tie)
+            .Select(e => (e.Target, e.Label, e.ClipPath))
+            .ToList();
     }
 
     // Replaces a passive Task.Delay between clips. NetCord's NormalizeSpeed paces these writes in real

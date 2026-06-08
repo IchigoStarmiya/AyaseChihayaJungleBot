@@ -46,7 +46,7 @@
             <Using Namespace="System.Text.RegularExpressions" />
             <Code Type="Fragment" Language="cs">
                 <![CDATA[
-                    var keys = new[] { "StartClipPath", "Warn40s", "Warn20s", "MaiJungle" };
+                    var keys = new[] { "StartClipPath", "Warn40s", "Warn20s", "MaiJungle", "ZealClipPath" };
                     var pattern = "\"(" + string.Join("|", keys) + ")\"\\s*:\\s*\"([^\"]+)\"";
                     var json = File.ReadAllText(AppSettingsPath);
                     var missing = new List<string>();

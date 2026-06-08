@@ -17,4 +17,5 @@ public class VoiceTimerGuildSettings
     public string Warn40s { get; set; } = "Audio/jungle.ogg";
     public string Warn20s { get; set; } = "Audio/jungle.ogg";
     public string MaiJungle { get; set; } = "Audio/jungle.ogg";
+    public string ZealClipPath { get; set; } = "";
 }
