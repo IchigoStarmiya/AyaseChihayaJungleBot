@@ -50,6 +50,8 @@ public class VoiceTimerService(
     private static readonly TimeSpan Warn20s = TimeSpan.FromSeconds(20);
     
     private static readonly TimeSpan ZealInterval = TimeSpan.FromMinutes(3);
+    
+    private const int ZealReminderCount = 7;
 
     // Only this guild gets the extra 60-second spawn warning.
     private const ulong Warn60GuildId = 1434117124833411215UL;
@@ -290,8 +292,9 @@ public class VoiceTimerService(
 
         if (!string.IsNullOrWhiteSpace(s.ZealClipPath))
         {
-            for (var t = ZealInterval; t <= TotalDuration; t += ZealInterval)
-                events.Add((t, 1, "zeal", s.ZealClipPath));
+            // Exactly ZealReminderCount cues at 3-minute steps: 3:00, 6:00, … 21:00.
+            for (var i = 1; i <= ZealReminderCount; i++)
+                events.Add((ZealInterval * i, 1, "zeal", s.ZealClipPath));
         }
 
         return events
