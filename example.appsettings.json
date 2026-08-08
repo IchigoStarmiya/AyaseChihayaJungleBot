@@ -20,6 +20,7 @@
         "ChannelId": 386933744025468943,
         "AuthorizedRoleId": 401363878820446208,
         "StartClipPath": "Audio/junglebot.opus",
+        "Warn60s": "Audio/juiced60.opus",
         "Warn40s": "Audio/respawn40.opus",
         "Warn20s": "Audio/respawn20.opus",
         "ZealClipPath": "Audio/zeal.opus"

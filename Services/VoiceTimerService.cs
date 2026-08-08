@@ -53,9 +53,6 @@ public class VoiceTimerService(
     
     private const int ZealReminderCount = 7;
 
-    // Only this guild gets the extra 60-second spawn warning.
-    private const ulong Warn60GuildId = 1434117124833411215UL;
-
     private readonly VoiceTimerSettings _settings = options.Value;
     private readonly Dictionary<ulong, GuildTimerState> _guilds =
         options.Value.Servers.ToDictionary(s => s.GuildId, s => new GuildTimerState(s));
@@ -274,7 +271,7 @@ public class VoiceTimerService(
     }
 
     // Builds the full, time-ordered list of cues to play for one session: the jungle spawn warnings
-    // (60s only for the opted-in guild, plus 40s and 20s) on the 5-minute spawn cycle, merged with the
+    // (60s where configured, plus 40s and 20s) on the 5-minute spawn cycle, merged with the
     // "upgrade zeal" GvG reminder on its 3-minute cadence. Targets are elapsed offsets from the start
     // clip. When two cues land on the same instant the jungle warning wins the tie so the time-critical
     // spawn cue is never delayed behind the zeal reminder.
@@ -282,9 +279,12 @@ public class VoiceTimerService(
     {
         var events = new List<(TimeSpan Target, int Tie, string Label, string ClipPath)>();
 
+        // The 60s warning is opt-in per guild, same as ZealClipPath: configure Warn60s to enable it.
+        var warn60 = !string.IsNullOrWhiteSpace(s.Warn60s);
+
         for (var spawnElapsed = FirstSpawnElapsed; spawnElapsed <= TotalDuration; spawnElapsed += SpawnInterval)
         {
-            if (s.GuildId == Warn60GuildId)
+            if (warn60)
                 events.Add((spawnElapsed - Warn60s, 0, "warn60", s.Warn60s));
             events.Add((spawnElapsed - Warn40s, 0, "warn40", s.Warn40s));
             events.Add((spawnElapsed - Warn20s, 0, "warn20", s.Warn20s));
