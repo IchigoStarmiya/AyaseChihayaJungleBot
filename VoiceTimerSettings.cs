@@ -19,4 +19,8 @@ public class VoiceTimerGuildSettings
     public string Warn20s { get; set; } = "Audio/jungle.ogg";
     public string MaiJungle { get; set; } = "Audio/jungle.ogg";
     public string ZealClipPath { get; set; } = "";
+    // The two boss cues are opt-in per guild: leave a path empty and that boss timer never runs
+    // for this guild. The first boss spawns 4 minutes after the bot is activated, the second at 14.
+    public string FirstBossClipPath { get; set; } = "";
+    public string SecondBossClipPath { get; set; } = "";
 }

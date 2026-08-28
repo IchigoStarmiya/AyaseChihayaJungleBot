@@ -50,6 +50,10 @@ public class VoiceTimerService(
     private static readonly TimeSpan Warn20s = TimeSpan.FromSeconds(20);
     
     private static readonly TimeSpan ZealInterval = TimeSpan.FromMinutes(3);
+
+    // The two bosses spawn at fixed offsets from activation, independent of the 5-minute jungle cycle.
+    private static readonly TimeSpan FirstBossElapsed = TimeSpan.FromMinutes(4);
+    private static readonly TimeSpan SecondBossElapsed = TimeSpan.FromMinutes(14);
     
     private const int ZealReminderCount = 7;
 
@@ -271,10 +275,12 @@ public class VoiceTimerService(
     }
 
     // Builds the full, time-ordered list of cues to play for one session: the jungle spawn warnings
-    // (60s where configured, plus 40s and 20s) on the 5-minute spawn cycle, merged with the
-    // "upgrade zeal" GvG reminder on its 3-minute cadence. Targets are elapsed offsets from the start
-    // clip. When two cues land on the same instant the jungle warning wins the tie so the time-critical
-    // spawn cue is never delayed behind the zeal reminder.
+    // (60s where configured, plus 40s and 20s) on the 5-minute spawn cycle, merged with the two boss
+    // spawns (4:00 and 14:00) and the "upgrade zeal" GvG reminder on its 3-minute cadence. Targets are
+    // elapsed offsets from the start clip. When cues land on the same instant they play jungle warning
+    // first, then boss, then zeal, so the most time-critical cue is never delayed behind a reminder.
+    // Note the 4:00 and 14:00 boss cues collide with the 60s warning for the 5:00 and 15:00 jungle
+    // spawns, so a guild configuring both hears the jungle warning immediately followed by the boss cue.
     private static List<(TimeSpan Target, string Label, string ClipPath)> BuildSchedule(VoiceTimerGuildSettings s)
     {
         var events = new List<(TimeSpan Target, int Tie, string Label, string ClipPath)>();
@@ -290,11 +296,19 @@ public class VoiceTimerService(
             events.Add((spawnElapsed - Warn20s, 0, "warn20", s.Warn20s));
         }
 
+        // Both boss cues are opt-in per guild, same as Warn60s: a guild that configures neither
+        // path contributes no boss cues and keeps exactly the schedule it had before.
+        if (!string.IsNullOrWhiteSpace(s.FirstBossClipPath))
+            events.Add((FirstBossElapsed, 1, "boss1", s.FirstBossClipPath));
+
+        if (!string.IsNullOrWhiteSpace(s.SecondBossClipPath))
+            events.Add((SecondBossElapsed, 1, "boss2", s.SecondBossClipPath));
+
         if (!string.IsNullOrWhiteSpace(s.ZealClipPath))
         {
             // Exactly ZealReminderCount cues at 3-minute steps: 3:00, 6:00, … 21:00.
             for (var i = 1; i <= ZealReminderCount; i++)
-                events.Add((ZealInterval * i, 1, "zeal", s.ZealClipPath));
+                events.Add((ZealInterval * i, 2, "zeal", s.ZealClipPath));
         }
 
         return events
